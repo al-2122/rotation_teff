@@ -1,9 +1,10 @@
 ---
 title: "RSA_day16_agar"
 author: "Alessandra Learmount"
-format: pdf
-editor: visual
-toc: TRUE
+format:
+  pdf:
+    fig-pos: "H"
+toc: true
 date: "2026-03-03"
 ---
 # Root Architecture Analysis of Day 16 Roots Grown on Agar
