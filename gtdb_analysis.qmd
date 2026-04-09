@@ -1,6 +1,18 @@
 ---
 title: "teff_gtdb_analysis"
-format: pdf
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+    self-contained: true
+    theme: cosmo
+    code-fold: true
+    fig-align: center
+  pdf:
+    toc: true
+    fig-pos: "H"
+    geometry: margin=2cm
 editor: visual
 toc: TRUE
 ---

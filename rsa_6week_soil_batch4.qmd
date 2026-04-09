@@ -1,8 +1,19 @@
 ---
 title: "rsa_6week_soil_batch4"
-output: html_document
 date: "2026-03-12"
-format: pdf
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+    self-contained: true
+    theme: cosmo
+    code-fold: true
+    fig-align: center
+  pdf:
+    toc: true
+    fig-pos: "H"
+    geometry: margin=2cm
 editor: visual
 toc: TRUE
 ---
