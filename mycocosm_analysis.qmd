@@ -1,6 +1,7 @@
 ---
 title: "teff_mycocosm_analysis"
 format: html
+format: pdf
 editor: visual
 toc: TRUE
 ---

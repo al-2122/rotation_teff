@@ -2,6 +2,7 @@
 title: "RSA_day16_agar"
 author: "Alessandra Learmount"
 format: html
+format: pdf
 editor: visual
 toc: TRUE
 date: "2026-03-03"
