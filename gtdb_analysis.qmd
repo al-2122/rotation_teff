@@ -1,0 +1,2170 @@
+---
+title: "teff_gtdb_analysis"
+format: html
+editor: visual
+toc: TRUE
+---
+
+## Load relevant libraries
+
+```{r}
+library(phyloseq); packageVersion("phyloseq")
+library(dplyr)
+library(ggplot2)
+library(microbiome)
+library(microViz)
+library(RColorBrewer)
+library(gdata)
+library(pairwiseAdonis)
+library(ggtext)
+library(kableExtra)
+library(vegan)
+library(paletteer)
+library(colorspace)
+library(emmeans)   
+library(car)
+library(effectsize)
+library(ggVennDiagram)
+library(indicspecies)
+library(tidyr)
+```
+
+Loading the results from the nanopore shotgun metagenomics.
+
+```{r}
+# Read OTU and tax matrices
+tax_mat <- read.table("~/Desktop/RStudio/teff_rotation_apr26/tax_matrix_gtdb_0.1.txt", sep="\t", row.names=1, header=TRUE)
+head(tax_mat)
+otu_mat <- read.table("~/Desktop/RStudio/teff_rotation_apr26/otu_matrix_gtdb_0.1.txt", sep="\t", row.names=1, header=TRUE)
+head(otu_mat)
+```
+
+## Importing sample metadata
+
+Read sample metadata BEFORE accessing otu_mat rownames
+
+Format of sample names 1. Sample site: Dowding (D) or Trinity Hall (T) 2. Soil: soil type explained 3. Database: Standard (S) or PlusPFP (P) 4. Accuracy: SUP (S) or HAC (H)) 5. Repeat: 1 or 2 6. Confidence: 0, 0.05 or 0.1
+
+```{r}
+sample_data_df <- read.csv("~/Desktop/RStudio/teff_rotation_apr26/dna_metadata_gtdb.csv", header=TRUE, row.names=1)
+head(sample_data_df)
+```
+
+Now print column names of otu_mat and the row names of sample data
+
+```{r}
+colnames(otu_mat)
+rownames(sample_data_df)
+```
+
+Check the sample names match the otu_mat names
+
+```{r}
+common_samples <- intersect(colnames(otu_mat), rownames(sample_data_df))
+print(common_samples)
+
+common_samples <- common_samples[common_samples != "barcode_unclassified"]
+print(paste("Samples after removing unclassified:", length(common_samples)))
+print(common_samples)
+```
+
+Subset common samples (only keeps samples which are common - should be everything)
+
+```{r}
+otu_mat <- otu_mat[, common_samples]
+sample_data_df <- sample_data_df[common_samples, ]
+```
+
+# Removing barcodes 23 and 24
+
+```{r}
+# NOTE: These samples showed near-zero read counts across all taxa in the
+# initial bar charts, indicating likely demultiplexing failure or insufficient
+# DNA input. Removed prior to phyloseq construction to avoid downstream bias.
+
+# Remove barcode23 and barcode24 by matching the full column name pattern
+remove_barcodes <- c("barcode23.k2.0.1.gtdb.report", 
+                     "barcode24.k2.0.1.gtdb.report")
+
+# Remove from OTU matrix (columns)
+otu_mat <- otu_mat[, !colnames(otu_mat) %in% remove_barcodes]
+
+# Remove from sample metadata (rows) - adjust if your metadata uses different names
+sample_data_df <- sample_data_df[!rownames(sample_data_df) %in% remove_barcodes, ]
+
+head(sample_data_df)
+
+
+# remove root 1 (redundant as we have root and introducing a number of NAs)
+tax_mat <- tax_mat[, colnames(tax_mat) != "r1"]
+```
+
+## Create phyloseq objects
+
+```{r}
+OTU <- phyloseq::otu_table(as.matrix(otu_mat), taxa_are_rows = TRUE)
+TAX <- phyloseq::tax_table(as.matrix(tax_mat))
+colnames(TAX) <- c("Root", "Phylum", "Class", "Order",
+                   "Family", "Genus", "Species")
+SAMP <- phyloseq::sample_data(sample_data_df)
+```
+
+## Build phyloseq object
+
+```{r}
+ps <- phyloseq::phyloseq(OTU, TAX, SAMP)
+
+ps
+head(sample_data(ps))
+sample_variables(ps)
+rank_names(ps)
+```
+
+### Tidying up labels in phyloseq objects and filtering taxonomic levels
+
+```{r}
+
+# Keep only taxa/rows that have a genus
+ps_species <- subset_taxa(ps, !is.na(Species) & Species != "")
+
+# Making sample variables into factors 
+ps_species <- ps_species %>%
+  ps_mutate(
+    Repeat = factor(Repeat),
+    Depth = factor(Depth), 
+    Genotype = factor(Genotype),
+    Barcode = factor(Barcode),
+    ID = factor(ID)
+  )
+
+# Keep only taxa/rows that have a genus
+ps_genus <- subset_taxa(ps, !is.na(Genus) & Genus != "")
+ 
+# Making sample variables into factors 
+ps_genus <- ps_genus %>%
+  ps_mutate(
+    Repeat = factor(Repeat),
+    Depth = factor(Depth), 
+    Genotype = factor(Genotype),
+    Barcode = factor(Barcode),
+    ID = factor(ID)
+  )
+
+# Filtering by genotype
+ps_dabbi_genus <- subset_samples(ps_genus, Genotype == "Dabbi")
+ps_tsedey_genus <- subset_samples(ps_genus, Genotype == "Tsedey")
+
+```
+
+# Filtering out the 1% least abundant reads/species
+
+```{r}
+# 2. Transform the absolute read counts into relative abundances (proportions)
+# This divides each taxon's count by the total classified reads in that sample [1].
+ps_rel_abun <- transform_sample_counts(ps_species, function(x) x / sum(x))
+
+# 3. Filter the taxa based on the 2.5% (0.025) threshold.
+# This keeps only taxa that have a relative abundance of at least 2% 
+# in at least one sample [3, 4].
+ps_filtered <- filter_taxa(ps_rel_abun, function(x) mean(x) >= 0.00055, TRUE)
+
+# 4. Apply this filter back to original absolute counts 
+# if you prefer to work with integers for downstream analysis.
+keep_taxa <- taxa_names(ps_filtered)
+ps_species <- prune_taxa(keep_taxa, ps_species)
+
+
+# 4. Apply this filter back to your original absolute counts 
+# if you prefer to work with integers for downstream analysis.
+keep_taxa <- taxa_names(ps_filtered)
+ps_genus <- prune_taxa(keep_taxa, ps_genus)
+```
+
+# Rarefaction for alpha diversity
+
+```{r}
+# ── Rarefaction for alpha diversity ───────────────────────────────────────
+# Rarefy to a fixed, threshold of 175 reads (chosen to ensure sufficient samples pass).
+# This retains all but 2 low-coverage samples (confirmed by inspecting
+# sorted library sizes below) while avoiding the OTU loss caused by
+# rarefying to the single minimum library size.
+# Used ONLY for alpha diversity — beta diversity uses CLR transformation
+# instead (see PCoA section).
+
+# ── 1. Examine library sizes ──────────────────────────────────────────────
+cat("=== Genus-level library sizes ===\n")
+lib_genus <- sort(sample_sums(ps_genus))
+print(lib_genus)
+cat(sprintf("\nMin: %d  |  Median: %.0f  |  Max: %d\n",
+            min(lib_genus), median(lib_genus), max(lib_genus)))
+
+cat("\n=== Species-level library sizes ===\n")
+lib_species <- sort(sample_sums(ps_species))
+print(lib_species)
+cat(sprintf("\nMin: %d  |  Median: %.0f  |  Max: %d\n",
+            min(lib_species), median(lib_species), max(lib_species)))
+
+# ── 2. Set fixed rarefaction threshold ───────────────────────────────────
+# 230 reads chosen by inspection of sorted library sizes: drops only the
+# 2 lowest-coverage samples and retains the majority of taxa.
+# Change this value if the library size distribution warrants a different cut.
+RAREFY_DEPTH <- 7458L
+
+cat(sprintf("\nFixed rarefaction threshold: %d reads\n", RAREFY_DEPTH))
+cat(sprintf("Genus-level   samples below threshold: %d\n",
+            sum(lib_genus   < RAREFY_DEPTH)))
+cat(sprintf("Species-level samples below threshold: %d\n",
+            sum(lib_species < RAREFY_DEPTH)))
+
+# ── 3. Remove samples below threshold ────────────────────────────────────
+ps_genus_filt   <- prune_samples(sample_sums(ps_genus)   >= RAREFY_DEPTH, ps_genus)
+ps_species_filt <- prune_samples(sample_sums(ps_species) >= RAREFY_DEPTH, ps_species)
+
+n_dropped_genus   <- nsamples(ps_genus)   - nsamples(ps_genus_filt)
+n_dropped_species <- nsamples(ps_species) - nsamples(ps_species_filt)
+
+cat(sprintf("\nGenus:   %d sample(s) removed\n", n_dropped_genus))
+cat(sprintf("Species: %d sample(s) removed\n",   n_dropped_species))
+
+# ── 4. Rarefy ─────────────────────────────────────────────────────────────
+set.seed(123)
+ps_genus_rar <- phyloseq::rarefy_even_depth(
+  ps_genus_filt,
+  sample.size = RAREFY_DEPTH,
+  rngseed     = 123,
+  replace     = FALSE,
+  trimOTUs    = TRUE,
+  verbose     = TRUE
+)
+
+set.seed(123)
+ps_species_rar <- phyloseq::rarefy_even_depth(
+  ps_species_filt,
+  sample.size = RAREFY_DEPTH,
+  rngseed     = 123,
+  replace     = FALSE,
+  trimOTUs    = TRUE,
+  verbose     = TRUE
+)
+
+cat(sprintf("\nFinal genus-level rarefied object:   %d samples, %d taxa\n",
+            nsamples(ps_genus_rar), ntaxa(ps_genus_rar)))
+cat(sprintf("Final species-level rarefied object: %d samples, %d taxa\n",
+            nsamples(ps_species_rar), ntaxa(ps_species_rar)))
+
+```
+
+### Bar Chart: Species Level Comparison
+
+```{r fig.width=10,fig.height=12, dpi=300}
+# Plot bar chart (hide gap labels; keep gaps as spacing)
+bar_s_myco <- ps_species %>%
+  comp_barplot(
+    tax_level   = "Species",
+    n_taxa      = 20,
+    x           = "ID",
+    label       = "ID",
+    palette     = distinct_palette(25, pal = "brewerPlus"),
+    sample_sort = "x"
+  ) +
+  coord_flip() +
+  theme(legend.key.size = unit(0.2, "cm"),
+        legend.text     = element_text(size = 10))
+
+plot(bar_s_myco)
+
+# Suggestion to use tax_fix but this messed up the taxonomic rankings (some genera were put at species level and some families in genus level)
+```
+
+### Bar Chart: Genus Level Comparison
+
+```{r fig.width=10,fig.height=12, dpi=300}
+# Plot bar chart (hide gap labels; keep gaps as spacing)
+bar_g_myco <- ps_genus %>%
+  comp_barplot(
+    tax_level   = "Genus",
+    n_taxa      = 20,
+    x           = "ID",
+    label       = "ID",
+    palette     = distinct_palette(25, pal = "brewerPlus"),
+    sample_sort = "x"
+  ) +
+  coord_flip() +
+  theme(legend.key.size = unit(0.2, "cm"),
+        legend.text     = element_text(size = 10))
+
+plot(bar_g_myco)
+
+```
+
+### Plotting most abundant taxa without filtering
+
+```{r fig.width=10,fig.height=12, dpi=300}
+# ── 1. Get top 20 genera by overall abundance (no filtering) ──
+top20_named <- names(sort(taxa_sums(ps_genus), decreasing = TRUE)[1:20])
+ps_top20    <- prune_taxa(top20_named, ps_genus)
+
+# ── 2. Prepare plot dataframe ─────────────────────────────────
+plot_df <- psmelt(ps_top20) %>%
+  group_by(Sample) %>%
+  mutate(RelAbund = Abundance / sum(Abundance) * 100) %>%
+  ungroup() %>%
+  mutate(
+    Depth       = factor(Depth, levels = c("Base", "Mid-section", "Tip")),
+    Genotype    = factor(Genotype, levels = c("Dabbi", "Tsedey")),
+    RepeatNum   = as.numeric(gsub("[A-Z]", "", ID)),
+    RepeatDepth = paste(gsub("[A-Z]", "", ID), Depth)
+  ) %>%
+  arrange(Depth, RepeatNum) %>%
+  mutate(RepeatDepth = factor(RepeatDepth, levels = unique(RepeatDepth)))
+
+# ── 3. Taxon colour order ─────────────────────────────────────
+taxon_order <- plot_df %>%
+  group_by(Genus) %>%
+  summarise(mean_ab = mean(RelAbund), .groups = "drop") %>%
+  arrange(desc(mean_ab)) %>%
+  pull(Genus)
+
+plot_df$Genus <- factor(plot_df$Genus, levels = rev(taxon_order))
+n_taxa <- nlevels(plot_df$Genus)
+
+tax_cols <- setNames(
+  colorRampPalette(brewer.pal(12, "Paired"))(n_taxa),
+  levels(plot_df$Genus)
+)
+
+# ── 4. Shared theme ───────────────────────────────────────────
+bar_theme <- theme_bw(base_size = 11) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 8),
+    axis.title.x     = element_blank(),
+    axis.title.y     = element_text(size = 9),
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 11),
+    legend.text      = element_text(face = "italic", size = 8),
+    legend.key.size  = unit(0.4, "cm"),
+    panel.spacing    = unit(0.8, "lines")
+  )
+
+# ── 5. Plot function per genotype ─────────────────────────────
+make_panel <- function(geno, show_legend = FALSE) {
+  df <- filter(plot_df, Genotype == geno)
+
+  p <- ggplot(df, aes(x = RepeatDepth, y = RelAbund, fill = Genus)) +
+    geom_col(width = 0.85, colour = NA) +
+    facet_wrap(~ Depth, scales = "free_x", nrow = 1) +
+    scale_fill_manual(values = tax_cols) +
+    scale_y_continuous(
+      expand = c(0, 0),
+      limits = c(0, 101),
+      breaks = c(0, 25, 50, 75, 100)
+    ) +
+    labs(
+      y    = "Relative abundance\n(% of top 20 genera)",  # ✔ fixed \\n → \n
+      fill = "Genus",
+      title = geno
+    ) +
+    bar_theme +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 1, size = 11,
+                                margin = margin(b = 2))
+    )
+
+  if (!show_legend) p <- p + theme(legend.position = "none")
+  p
+}
+
+# ── 6. Build and combine ──────────────────────────────────────
+library(patchwork)  # ✔ required for / and & operators
+
+p_dabbi  <- make_panel("Dabbi",  show_legend = FALSE)
+p_tsedey <- make_panel("Tsedey", show_legend = FALSE)
+
+p_combined <- (p_dabbi / p_tsedey) +
+  plot_layout(guides = "collect") &  # ✔ collects legends into one
+  theme(
+    legend.position = "right",
+    plot.margin     = margin(t = 5, r = 5, b = 5, l = 5)
+  )
+
+print(p_combined)
+
+```
+
+### Plotting most abundant taxa with filtering
+
+```{r fig.width=10,fig.height=12, dpi=300}
+library(patchwork)  # ✔ required for / and & operators
+
+# ── 1. Prepare data ───────────────────────────────────────────
+# GTDB unnamed lineage pattern
+gtdb_unnamed <- paste0(
+  "^[A-Z]{2,}[0-9]+$",
+  "|^UBA", "|^TH[0-9]",
+  "|^BOG-", "|^PALSA-",
+  "|^FEB-", "|^DP-",
+  "|^ZC4", "|^JALH", "|^JADJ",
+  "|^JAJK", "|^JAEU",
+  "|^CAMLFJ", "|^WHUA",
+  "|^IMCC", "|^AWTP",
+  "|^TA-", "|^Ch[0-9]",
+  "|^Nitrospira_[A-Z]",
+  "|^Ga[0-9]",
+  "|^Palsa-"
+)
+
+# Remove taxa with no resolved genus name or GTDB placeholder codes
+ps_named <- subset_taxa(ps_genus,
+  !is.na(Genus) &
+  Genus != "" &
+  !grepl(gtdb_unnamed, Genus) &
+  !grepl("^[Uu]nclassified|^[Uu]nknown|^uncultured", Genus)
+)
+
+# Get top 20 named taxa by overall abundance
+top20_named <- names(sort(taxa_sums(ps_named), decreasing = TRUE)[1:20])
+
+# Prune to only those 20 taxa (raw counts — no transformation yet)
+ps_top20 <- prune_taxa(top20_named, ps_named)
+
+plot_df <- psmelt(ps_top20) %>%
+  group_by(Sample) %>%
+  mutate(RelAbund = Abundance / sum(Abundance) * 100) %>%
+  ungroup() %>%
+  mutate(
+    Depth       = factor(Depth, levels = c("Base", "Mid-section", "Tip")),
+    Genotype    = factor(Genotype, levels = c("Dabbi", "Tsedey")),
+    RepeatDepth = paste0(gsub("[A-Z]", "", ID), "\n", Depth)  # ✔ fixed \\n → \n
+  )
+
+# Fix x-axis order: sort by repeat number within each depth
+plot_df <- plot_df %>%
+  mutate(RepeatNum = as.numeric(gsub("[A-Z]", "", ID))) %>%
+  arrange(Depth, RepeatNum) %>%
+  mutate(RepeatDepth = factor(RepeatDepth, levels = unique(RepeatDepth)))
+
+# ── 2. Consistent taxon colour order ─────────────────────────
+taxon_order <- plot_df %>%
+  group_by(Genus) %>%
+  summarise(mean_ab = mean(RelAbund), .groups = "drop") %>%
+  arrange(desc(mean_ab)) %>%
+  pull(Genus)
+
+plot_df$Genus <- factor(plot_df$Genus, levels = rev(taxon_order))
+
+n_taxa   <- nlevels(plot_df$Genus)  # ✔ nlevels() is safer than length(unique()) after factoring
+tax_cols <- setNames(
+  colorRampPalette(brewer.pal(12, "Paired"))(n_taxa),
+  levels(plot_df$Genus)
+)
+
+# ── 3. Shared theme ───────────────────────────────────────────
+bar_theme <- theme_bw(base_size = 11) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 8),
+    axis.title.x     = element_blank(),
+    axis.title.y     = element_text(size = 9),
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 11),
+    legend.text      = element_text(face = "italic", size = 8),
+    legend.key.size  = unit(0.4, "cm"),
+    panel.spacing    = unit(0.8, "lines")
+  )
+
+# ── 4. Plot function per genotype ─────────────────────────────
+make_panel <- function(geno, show_legend = FALSE) {
+  df <- filter(plot_df, Genotype == geno)
+
+  p <- ggplot(df, aes(x = RepeatDepth, y = RelAbund, fill = Genus)) +
+    geom_col(width = 0.85, colour = NA) +
+    facet_wrap(~ Depth, scales = "free_x", nrow = 1) +
+    scale_fill_manual(values = tax_cols) +
+    scale_y_continuous(
+      expand = c(0, 0),
+      limits = c(0, 101),
+      breaks = c(0, 25, 50, 75, 100)
+    ) +
+    labs(
+      y     = "Relative abundance (% of top 20 named genera)",  # ✔ fixed \\n → \n
+      fill  = "Genus",
+      title = geno
+    ) +
+    bar_theme +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 1, size = 11,
+                                margin = margin(b = 2))
+    )
+
+  if (!show_legend) p <- p + theme(legend.position = "none")
+  p
+}
+
+# ── 5. Build individual panels ────────────────────────────────
+p_dabbi  <- make_panel("Dabbi",  show_legend = FALSE)
+p_tsedey <- make_panel("Tsedey", show_legend = FALSE)
+
+# ── 6. Combine with patchwork ─────────────────────────────────
+p_combined <- (p_dabbi / p_tsedey) +
+  plot_layout(guides = "collect") &  # ✔ merges legends into one
+  theme(
+    legend.position = "right",
+    plot.margin     = margin(t = 5, r = 5, b = 5, l = 5)
+  )
+
+print(p_combined)
+
+```
+
+## changing panel composition to look at depths next to each other
+
+```{r fig.width=14,fig.height=24, dpi=300}
+library(patchwork)  # ✔ required for / and & operators
+
+# ── 1. Prepare data ───────────────────────────────────────────
+# GTDB unnamed lineage pattern
+gtdb_unnamed <- paste0(
+  "^[A-Z]{2,}[0-9]+$",
+  "|^UBA", "|^TH[0-9]",
+  "|^BOG-", "|^PALSA-",
+  "|^FEB-", "|^DP-",
+  "|^ZC4", "|^JALH", "|^JADJ",
+  "|^JAJK", "|^JAEU",
+  "|^CAMLFJ", "|^WHUA",
+  "|^IMCC", "|^AWTP",
+  "|^TA-", "|^Ch[0-9]",
+  "|^Nitrospira_[A-Z]",
+  "|^Ga[0-9]",
+  "|^Palsa-"
+)
+
+# Remove taxa with no resolved genus name or GTDB placeholder codes
+ps_named <- subset_taxa(ps_genus,
+  !is.na(Genus) &
+  Genus != "" &
+  !grepl(gtdb_unnamed, Genus) &
+  !grepl("^[Uu]nclassified|^[Uu]nknown|^uncultured", Genus)
+)
+
+# Get top 20 named taxa by overall abundance
+top20_named <- names(sort(taxa_sums(ps_named), decreasing = TRUE)[1:20])
+
+# Prune to only those 20 taxa (raw counts — no transformation yet)
+ps_top20 <- prune_taxa(top20_named, ps_named)
+
+plot_df <- psmelt(ps_top20) %>%
+  group_by(Sample) %>%
+  mutate(RelAbund = Abundance / sum(Abundance) * 100) %>%
+  ungroup() %>%
+  mutate(
+    Depth       = factor(Depth, levels = c("Base", "Mid-section", "Tip")),
+    Genotype    = factor(Genotype, levels = c("Dabbi", "Tsedey")),
+    RepeatDepth = paste0(gsub("[A-Z]", "", ID), " \n", Depth)  # space before newline
+  )
+
+# Fix x-axis order: sort by repeat number within each depth
+plot_df <- plot_df %>%
+  mutate(RepeatNum = as.numeric(gsub("[A-Z]", "", ID))) %>%
+  arrange(Depth, RepeatNum) %>%
+  mutate(RepeatDepth = factor(RepeatDepth, levels = unique(RepeatDepth)))
+
+# ── 2. Consistent taxon colour order ─────────────────────────
+taxon_order <- plot_df %>%
+  group_by(Genus) %>%
+  summarise(mean_ab = mean(RelAbund), .groups = "drop") %>%
+  arrange(desc(mean_ab)) %>%
+  pull(Genus)
+
+plot_df$Genus <- factor(plot_df$Genus, levels = rev(taxon_order))
+
+n_taxa   <- nlevels(plot_df$Genus)
+tax_cols <- setNames(
+  colorRampPalette(brewer.pal(12, "Paired"))(n_taxa),
+  levels(plot_df$Genus)
+)
+
+# ── 3. Shared theme ───────────────────────────────────────────
+bar_theme <- theme_bw(base_size = 14) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 14),
+    axis.title.x     = element_blank(),
+    axis.title.y     = element_text(size = 17),
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 16),
+    legend.text      = element_text(face = "italic", size = 14),
+    legend.key.size  = unit(0.4, "cm"),
+    panel.spacing    = unit(0.8, "lines")
+  )
+
+# ── 4. Plot function per depth ────────────────────────────────
+make_panel <- function(depth, show_legend = FALSE) {
+  df <- filter(plot_df, Depth == depth)
+
+  p <- ggplot(df, aes(x = RepeatDepth, y = RelAbund, fill = Genus)) +
+    geom_col(width = 0.85, colour = NA) +
+    facet_wrap(~ Genotype, scales = "free_x", nrow = 1) +
+    scale_fill_manual(values = tax_cols) +
+    scale_y_continuous(
+      expand = c(0, 0),
+      limits = c(0, 101),
+      breaks = c(0, 25, 50, 75, 100)
+    ) +
+    labs(
+      y     = "Relative abundance\n(% of top 20 genera)",
+      fill  = "Genus",
+      title = depth
+    ) +
+    bar_theme +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 1, size = 14,
+                                margin = margin(b = 2))
+    )
+
+  if (!show_legend) p <- p + theme(legend.position = "none")
+  p
+}
+
+# ── 5. Build individual panels ────────────────────────────────
+p_base  <- make_panel("Base",  show_legend = FALSE)
+p_mid   <- make_panel("Mid-section", show_legend = FALSE)
+p_tip   <- make_panel("Tip", show_legend = FALSE)
+
+# ── 6. Combine with patchwork ─────────────────────────────────
+p_combined <- (p_base / p_mid / p_tip) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "right",
+    plot.margin     = margin(t = 5, r = 5, b = 5, l = 5)
+  )
+
+print(p_combined)
+```
+
+## Unfiltered by depth and genotype
+
+```{r fig.width=14,fig.height=24, dpi=300}
+library(patchwork)  # ✔ required for / and & operators
+
+# ── 1. Prepare data ───────────────────────────────────────────
+# Get top 20 taxa by overall abundance from ps_genus (no name filtering)
+top20_all <- names(sort(taxa_sums(ps_genus), decreasing = TRUE)[1:20])
+
+# Prune to only those 20 taxa (raw counts — no transformation yet)
+ps_top20 <- prune_taxa(top20_all, ps_genus)
+
+plot_df <- psmelt(ps_top20) %>%
+  group_by(Sample) %>%
+  mutate(RelAbund = Abundance / sum(Abundance) * 100) %>%
+  ungroup() %>%
+  mutate(
+    Depth       = factor(Depth, levels = c("Base", "Mid-section", "Tip")),
+    Genotype    = factor(Genotype, levels = c("Dabbi", "Tsedey")),
+    RepeatDepth = paste0(gsub("[A-Z]", "", ID), " \n", Depth)  # space before newline
+  )
+
+# Fix x-axis order: sort by repeat number within each depth
+plot_df <- plot_df %>%
+  mutate(RepeatNum = as.numeric(gsub("[A-Z]", "", ID))) %>%
+  arrange(Depth, RepeatNum) %>%
+  mutate(RepeatDepth = factor(RepeatDepth, levels = unique(RepeatDepth)))
+
+# ── 2. Consistent taxon colour order ─────────────────────────
+taxon_order <- plot_df %>%
+  group_by(Genus) %>%
+  summarise(mean_ab = mean(RelAbund), .groups = "drop") %>%
+  arrange(desc(mean_ab)) %>%
+  pull(Genus)
+
+plot_df$Genus <- factor(plot_df$Genus, levels = rev(taxon_order))
+
+n_taxa   <- nlevels(plot_df$Genus)
+tax_cols <- setNames(
+  colorRampPalette(brewer.pal(12, "Paired"))(n_taxa),
+  levels(plot_df$Genus)
+)
+
+# ── 3. Shared theme ───────────────────────────────────────────
+bar_theme <- theme_bw(base_size = 14) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 14),
+    axis.title.x     = element_blank(),
+    axis.title.y     = element_text(size = 17),
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 16),
+    legend.text      = element_text(face = "italic", size = 14),
+    legend.key.size  = unit(0.4, "cm"),
+    panel.spacing    = unit(0.8, "lines")
+  )
+
+# ── 4. Plot function per depth ────────────────────────────────
+make_panel <- function(depth, show_legend = FALSE) {
+  df <- filter(plot_df, Depth == depth)
+
+  p <- ggplot(df, aes(x = RepeatDepth, y = RelAbund, fill = Genus)) +
+    geom_col(width = 0.85, colour = NA) +
+    facet_wrap(~ Genotype, scales = "free_x", nrow = 1) +
+    scale_fill_manual(values = tax_cols) +
+    scale_y_continuous(
+      expand = c(0, 0),
+      limits = c(0, 101),
+      breaks = c(0, 25, 50, 75, 100)
+    ) +
+    labs(
+      y     = "Relative abundance\n(% of top 20 genera)",
+      fill  = "Genus",
+      title = depth
+    ) +
+    bar_theme +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 1, size = 14,
+                                margin = margin(b = 2))
+    )
+
+  if (!show_legend) p <- p + theme(legend.position = "none")
+  p
+}
+
+# ── 5. Build individual panels ────────────────────────────────
+p_base  <- make_panel("Base",  show_legend = FALSE)
+p_mid   <- make_panel("Mid-section", show_legend = FALSE)
+p_tip   <- make_panel("Tip", show_legend = FALSE)
+
+# ── 6. Combine with patchwork ─────────────────────────────────
+p_combined <- (p_base / p_mid / p_tip) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "right",
+    plot.margin     = margin(t = 5, r = 5, b = 5, l = 5)
+  )
+
+print(p_combined)
+```
+
+## PCoA for depth and genotype
+
+```{r fig.width=12, fig.height=10, dpi=300}
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(phyloseq)
+library(microbiome)
+
+# CLR-transform then compute Euclidean (= Aitchison) distance
+ps_genus_clr <- microbiome::transform(ps_genus, transform = "clr")
+pcoa_res     <- ordinate(ps_genus_clr, method = "PCoA", distance = "euclidean")
+
+# Create genotype_depth grouping
+sample_data(ps_genus_clr)$genotype_depth <- paste(
+  sample_data(ps_genus_clr)$Genotype,
+  sample_data(ps_genus_clr)$Depth,
+  sep = "_"
+)
+
+# Nature-style palette
+colmap <- c(
+  "Dabbi_Base"         = "#9ECAE1",
+  "Dabbi_Mid-section"  = "#3182BD",
+  "Dabbi_Tip"          = "#08519C",
+  "Tsedey_Base"        = "#FDAE6B",
+  "Tsedey_Mid-section" = "#E6550D",
+  "Tsedey_Tip"         = "#A63603"
+)
+
+# Same shape within genotype, mapped at genotype_depth level for merged legend
+shapemap <- c(
+  "Dabbi_Base"         = 16,
+  "Dabbi_Mid-section"  = 16,
+  "Dabbi_Tip"          = 16,
+  "Tsedey_Base"        = 17,
+  "Tsedey_Mid-section" = 17,
+  "Tsedey_Tip"         = 17
+)
+
+var_exp   <- pcoa_res$values$Relative_eig * 100
+xlab_text <- paste0("PCoA1 (", round(var_exp[1], 1), "%)")
+ylab_text <- paste0("PCoA2 (", round(var_exp[2], 1), "%)")
+
+meta_df <- as(sample_data(ps_genus_clr), "data.frame") %>%
+  tibble::rownames_to_column("samples") %>%
+  dplyr::select(samples, genotype_depth, Genotype, Depth)
+
+positions <- as_tibble(pcoa_res$vectors, rownames = "samples") %>%
+  dplyr::rename(PCoA1 = Axis.1, PCoA2 = Axis.2) %>%
+  left_join(meta_df, by = "samples")
+
+# Function to generate a covariance ellipse manually
+make_ellipse <- function(df, level = 0.68, npoints = 200) {
+  if (nrow(df) < 3) return(NULL)
+
+  center <- c(mean(df$PCoA1), mean(df$PCoA2))
+  covmat <- stats::cov(cbind(df$PCoA1, df$PCoA2))
+
+  if (any(is.na(covmat)) || det(covmat) <= 0) return(NULL)
+
+  angles <- seq(0, 2 * pi, length.out = npoints)
+  circle <- cbind(cos(angles), sin(angles))
+
+  radius <- sqrt(qchisq(level, df = 2))
+  ell <- t(center + radius * t(circle %*% chol(covmat)))
+
+  out <- as.data.frame(ell)
+  colnames(out) <- c("PCoA1", "PCoA2")
+  out$genotype_depth <- unique(df$genotype_depth)
+  out
+}
+
+ellipse_df <- positions %>%
+  group_by(genotype_depth) %>%
+  group_split() %>%
+  lapply(make_ellipse, level = 0.68) %>%
+  bind_rows()
+
+pcoa_plot <- ggplot(positions, aes(x = PCoA1, y = PCoA2)) +
+  geom_polygon(
+    data = ellipse_df,
+    aes(fill = genotype_depth, group = genotype_depth),
+    alpha = 0.15,
+    colour = NA,
+    show.legend = FALSE
+  ) +
+  geom_path(
+    data = ellipse_df,
+    aes(colour = genotype_depth, group = genotype_depth),
+    linewidth = 0.7,
+    lineend = "round",
+    show.legend = FALSE
+  ) +
+  geom_point(
+    aes(colour = genotype_depth, shape = genotype_depth),
+    size = 3.2,
+    stroke = 0.7
+  ) +
+  labs(
+    x = xlab_text,
+    y = ylab_text,
+    colour = "Genotype × Depth",
+    shape  = "Genotype × Depth"
+  ) +
+  scale_colour_manual(values = colmap) +
+  scale_fill_manual(values = colmap) +
+  scale_shape_manual(values = shapemap) +
+  scale_x_continuous(expand = expansion(mult = 0.12)) +
+  scale_y_continuous(expand = expansion(mult = 0.12)) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text         = element_text(size = 11, colour = "black"),
+    axis.title        = element_text(size = 12, face = "plain"),
+    axis.line         = element_line(colour = "black", linewidth = 0.5),
+    axis.ticks        = element_line(colour = "black", linewidth = 0.4),
+    legend.position   = "right",
+    legend.title      = element_text(size = 10, face = "bold"),
+    legend.text       = element_text(size = 9),
+    legend.key.size   = unit(0.5, "cm"),
+    legend.background = element_blank(),
+    plot.margin       = margin(10, 15, 10, 10)
+  )
+
+print(pcoa_plot)
+```
+
+### Genus Level PCoA — Bray-Curtis and Aitchison (both retained for comparison)
+
+```{r fig.width=12, fig.height=10, dpi=300}
+# ── Bray-Curtis (retained for comparison with literature) ────
+pcoa_res_bc <- ordinate(ps_genus, method = "PCoA", distance = "bray")
+
+var_exp    <- pcoa_res_bc$values$Relative_eig * 100
+xlab_text <- paste0("PCoA1 (", round(var_exp[1], 1), "%)")
+ylab_text <- paste0("PCoA2 (", round(var_exp[2], 1), "%)")
+grp_levels <- levels(sample_data(ps_genus)$Depth)
+pal        <- qualitative_hcl(length(grp_levels), palette = "Dark 3")
+
+ord_genus_bc <- plot_ordination(ps_genus, pcoa_res_bc,
+                                color = "Depth", shape = "Genotype") +
+  geom_point(size = 5, alpha = 0.7) +
+  stat_ellipse(aes(color = Depth, group = Depth),
+               type = "t", level = 0.95, linewidth = 0.8,
+               linetype = "dashed", show.legend = FALSE) +
+  scale_color_manual(values = setNames(pal, grp_levels)) +
+  labs(x = xlab_text, y = ylab_text,
+       title = "Bray–Curtis PCoA — Depth (colour) & Genotype (shape)") +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom")
+print(ord_genus_bc)
+
+# ── Aitchison (CLR–Euclidean) — recommended for compositional data ───────
+ps_genus_clr <- microbiome::transform(ps_genus, transform = "clr")
+pcoa_res_ait <- ordinate(ps_genus_clr, method = "PCoA", distance = "euclidean")
+
+var_exp_a  <- pcoa_res_ait$values$Relative_eig * 100
+xlab_ait   <- paste0("PCoA1 (", round(var_exp_a[1], 1), "%)")
+ylab_ait   <- paste0("PCoA2 (", round(var_exp_a[2], 1), "%)")
+
+ord_genus_ait <- plot_ordination(ps_genus_clr, pcoa_res_ait,
+                                 color = "Depth", shape = "Genotype") +
+  geom_point(size = 5, alpha = 0.7) +
+  stat_ellipse(aes(color = Depth, group = Depth),
+               type = "t", level = 0.95, linewidth = 0.8,
+               linetype = "dashed", show.legend = FALSE) +
+  scale_color_manual(values = setNames(pal, grp_levels)) +
+  labs(x = xlab_ait, y = ylab_ait,
+       title = "Aitchison (CLR–Euclidean) PCoA — Depth (colour) & Genotype (shape)") +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom")
+print(ord_genus_ait)
+```
+
+## Identify taxa which are constant across samples (could indicate genera which are important for soil health/functioning) - core taxa
+
+```{r}
+# ── 1. Core at genus level ────────────────────────────────────
+otu_mat_core <- as(phyloseq::otu_table(ps_genus), "matrix")
+if (!phyloseq::taxa_are_rows(ps_genus)) otu_mat_core <- t(otu_mat_core)
+
+n_samples <- phyloseq::nsamples(ps_genus)
+present_in <- rowSums(otu_mat_core > 0)
+
+# Present in 100% of samples
+core_100 <- names(present_in[present_in == n_samples])
+core_genera_100 <- unique(phyloseq::tax_table(ps_genus)[core_100, "Genus"])
+cat("Genera in 100% of samples:", length(core_genera_100), "\n")
+print(core_genera_100)
+
+# Present in ≥75% of samples (more relaxed threshold)
+core_75 <- names(present_in[present_in >= ceiling(0.75 * n_samples)])
+core_genera_75 <- unique(phyloseq::tax_table(ps_genus)[core_75, "Genus"])
+cat("\nGenera in ≥75% of samples:", length(core_genera_75), "\n")
+print(core_genera_75)
+
+# ── 2. Core shared between both genotypes ─────────────────────
+dabbi_present  <- rowSums(as(phyloseq::otu_table(
+  phyloseq::subset_samples(ps_genus, Genotype == "Dabbi")),  "matrix") > 0)
+tsedey_present <- rowSums(as(phyloseq::otu_table(
+  phyloseq::subset_samples(ps_genus, Genotype == "Tsedey")), "matrix") > 0)
+
+# Taxa present in at least one sample of EACH genotype
+shared_taxa <- intersect(names(dabbi_present[dabbi_present > 0]),
+                          names(tsedey_present[tsedey_present > 0]))
+shared_genera <- unique(phyloseq::tax_table(ps_genus)[shared_taxa, "Genus"])
+cat("\nGenera shared across both genotypes:", length(shared_genera), "\n")
+print(shared_genera)
+
+```
+
+## Venn diagram of shared species across genotypes
+
+```{r fig.width=12, fig.height=10, dpi=300}
+# Install if needed: install.packages("ggVennDiagram")
+library(ggVennDiagram)
+
+# 1. Extract Species lists for each Location
+dabbi_taxa <- ps_species %>%
+  subset_samples(Genotype == "Dabbi") %>%
+  prune_taxa(taxa_sums(.) > 0, .) %>%
+  taxa_names()
+
+tsedey_taxa <- ps_species %>%
+  subset_samples(Genotype == "Tsedey") %>%
+  prune_taxa(taxa_sums(.) > 0, .) %>%
+  taxa_names()
+
+# 2. Create List
+venn_list <- list(Dabbi = dabbi_taxa, Tsedey = tsedey_taxa)
+
+# 3. Plot
+ggVennDiagram(venn_list, label_alpha = 0) + 
+  scale_fill_gradient(low = "white", high = "lightblue") +
+  labs(title = "Shared Genera between Genotype")
+
+```
+
+## Venn diagram of shared species across root depths
+
+```{r fig.width=12, fig.height=10, dpi=300}
+# Install if needed: install.packages("ggVennDiagram")
+library(ggVennDiagram)
+
+# 1. Extract species lists for each Location
+base_taxa <- taxa_names(subset_samples(ps_species, Depth == "Base") %>% prune_taxa(taxa_sums(.) > 0, .))
+mid_section_taxa <- taxa_names(subset_samples(ps_species, Depth == "Mid-section") %>% prune_taxa(taxa_sums(.) > 0, .))
+tip_taxa <- taxa_names(subset_samples(ps_species, Depth == "Tip") %>% prune_taxa(taxa_sums(.) > 0, .))
+
+# 2. Create List
+venn_list <- list(Base = base_taxa, Mid_section = mid_section_taxa, Tip = tip_taxa)
+
+# 3. Plot
+ggVennDiagram(venn_list, label_alpha = 0) + 
+  scale_fill_gradient(low = "white", high = "lightblue") +
+  labs(title = "Shared Genera between Genotype")
+
+```
+
+## Venn diagram of shared genera across genotypes
+
+```{r fig.width=12, fig.height=10, dpi=300}
+# Install if needed: install.packages("ggVennDiagram")
+library(ggVennDiagram)
+
+# 1. Extract Genus lists for each Location
+dabbi_taxa <- taxa_names(subset_samples(ps_genus, Genotype == "Dabbi") %>% prune_taxa(taxa_sums(.) > 0, .))
+tsedey_taxa <- taxa_names(subset_samples(ps_genus, Genotype == "Tsedey") %>% prune_taxa(taxa_sums(.) > 0, .))
+
+# 2. Create List
+venn_list <- list(Dabbi = dabbi_taxa, Tsedey = tsedey_taxa)
+
+# 3. Plot
+ggVennDiagram(venn_list, label_alpha = 0) + 
+  scale_fill_gradient(low = "white", high = "lightblue") +
+  labs(title = "Shared Genera between Genotype")
+
+```
+
+## Venn diagram of shared genera across root depths
+
+```{r fig.width=12, fig.height=10, dpi=300}
+# Install if needed: install.packages("ggVennDiagram")
+library(ggVennDiagram)
+
+# 1. Extract Genus lists for each Location
+base_taxa <- taxa_names(subset_samples(ps_genus, Depth == "Base") %>% prune_taxa(taxa_sums(.) > 0, .))
+mid_section_taxa <- taxa_names(subset_samples(ps_genus, Depth == "Mid-section") %>% prune_taxa(taxa_sums(.) > 0, .))
+tip_taxa <- taxa_names(subset_samples(ps_genus, Depth == "Tip") %>% prune_taxa(taxa_sums(.) > 0, .))
+
+# 2. Create List
+venn_list <- list(Base = base_taxa, Mid_section = mid_section_taxa, Tip = tip_taxa)
+
+# 3. Plot
+ggVennDiagram(venn_list, label_alpha = 0) + 
+  scale_fill_gradient(low = "white", high = "lightblue") +
+  labs(title = "Shared Genera across Root Depths")
+
+```
+
+## Alpha Diversity at the genus level by genotype
+
+```{r fig.width=12,fig.height=12, dpi=300}
+# Uses ps_genus_rar (rarefied) to avoid richness inflation from unequal depth
+alpha_tbl <- phyloseq::estimate_richness(
+  ps_genus_rar, measures = c("Shannon", "Simpson", "Observed", "Chao1")
+) %>%
+  tibble::rownames_to_column("SampleID")
+
+meta_tbl <- as(sample_data(ps_genus_rar), "data.frame") %>%
+  tibble::rownames_to_column("SampleID")
+
+df_alpha <- dplyr::left_join(meta_tbl, alpha_tbl, by = "SampleID") %>%
+  dplyr::mutate(Depth = factor(Depth))
+
+df_long <- df_alpha %>%
+  tidyr::pivot_longer(
+    cols = c(Shannon, Simpson, Observed, Chao1),
+    names_to = "Measure",
+    values_to = "Value"
+  )
+
+ggplot(df_long, aes(x = Genotype, y = Value, colour = Genotype, shape = Depth)) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.8, size = 2) +
+  facet_wrap(~ Measure, scales = "free_y") +
+  labs(
+    x = NULL,
+    y = "Alpha diversity",
+    title = "Alpha diversity by Genotype (rarefied)",
+    shape = "Depth"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+Labelling individual points to determine which are driving these differences in alpha diversity
+
+```{r fig.width=20,fig.height=20, dpi=300}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+
+# Uses ps_genus_rar (rarefied) to avoid richness inflation from unequal depth
+alpha_tbl <- phyloseq::estimate_richness(
+  ps_genus_rar, measures = c("Shannon", "Simpson", "Observed", "Chao1")
+) %>%
+  tibble::rownames_to_column("SampleID")
+
+meta_tbl <- as(sample_data(ps_genus_rar), "data.frame") %>%
+  tibble::rownames_to_column("SampleID")
+
+df_alpha <- dplyr::left_join(meta_tbl, alpha_tbl, by = "SampleID") %>%
+  dplyr::mutate(Depth = factor(Depth))
+
+df_long <- df_alpha %>%
+  pivot_longer(
+    cols = c(Shannon, Simpson, Observed, Chao1),
+    names_to = "Measure",
+    values_to = "Value"
+  )
+
+ggplot(df_long, aes(x = Genotype, y = Value, colour = Genotype, shape = Depth)) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.8, size = 2) +
+  geom_text_repel(
+    aes(label = SampleID),
+    size = 3,
+    show.legend = FALSE,
+    max.overlaps = Inf,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    min.segment.length = 0
+  ) +
+  facet_wrap(~ Measure, scales = "free_y") +
+  labs(
+    x = NULL,
+    y = "Alpha diversity",
+    title = "Alpha diversity by Genotype (rarefied)",
+    shape = "Depth"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Alpha Diversity at the genus level by depth
+
+```{r fig.width=12,fig.height=12, dpi=300}
+ggplot(df_long, aes(x = Depth, y = Value, colour = Depth)) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.8, size = 2) +
+  facet_wrap(~ Measure, scales = "free_y") +
+  labs(x = NULL, y = "Alpha diversity",
+       title = "Alpha diversity by Depth (rarefied)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+## Alpha Diversity at the species level by genotype
+
+```{r fig.width=12,fig.height=12, dpi=300}
+
+# Diversity measures
+alpha_tbl <- phyloseq::estimate_richness(
+  ps_species_rar, measures = c("Shannon","Simpson","Observed","Chao1")
+) %>%
+  tibble::rownames_to_column("SampleID")
+
+# Metadata extraction
+meta_tbl <- as(sample_data(ps_species_rar), "data.frame") %>%
+  tibble::rownames_to_column("SampleID")
+
+# Merge for plotting
+df_alpha <- dplyr::left_join(meta_tbl, alpha_tbl, by = "SampleID")
+
+# Reshape for faceted plotting
+df_long <- df_alpha %>%
+  pivot_longer(cols = c(Shannon, Simpson, Observed, Chao1),
+               names_to = "Measure", values_to = "Value")
+
+# Plot
+ggplot(df_long, aes(x = Genotype, y = Value, colour = Genotype)) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.8, size = 2) +
+  facet_wrap(~ Measure, scales = "free_y") +
+  labs(x = NULL, y = "Alpha diversity", title = "Alpha diversity by Genotype (rarefied)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+# Alpha Diversity at the species level by depth
+
+```{r fig.width=12,fig.height=12, dpi=300}
+
+# Diversity measures
+alpha_tbl <- phyloseq::estimate_richness(
+  ps_species_rar, measures = c("Shannon","Simpson","Observed","Chao1")
+) %>%
+  tibble::rownames_to_column("SampleID")
+
+# Metadata extraction
+meta_tbl <- as(sample_data(ps_species_rar), "data.frame") %>%
+  tibble::rownames_to_column("SampleID")
+
+# Merge for plotting
+df_alpha <- dplyr::left_join(meta_tbl, alpha_tbl, by = "SampleID")
+
+# Reshape for faceted plotting
+df_long <- df_alpha %>%
+  pivot_longer(cols = c(Shannon, Simpson, Observed, Chao1),
+               names_to = "Measure", values_to = "Value")
+
+# Plot
+ggplot(df_long, aes(x = Depth, y = Value, colour = Depth)) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.8, size = 2) +
+  facet_wrap(~ Measure, scales = "free_y") +
+  labs(x = NULL, y = "Alpha diversity", title = "Alpha diversity by Depth (rarefied)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+## Stats to assess differences in alpha diversity
+
+```{r}
+# ── 1. Extract metadata ───────────────────────────────────────
+meta <- as(sample_data(ps_genus_rar), "data.frame") %>%
+  tibble::rownames_to_column("SampleID") %>%
+  dplyr::mutate(
+    Genotype = factor(Genotype),
+    Depth    = factor(Depth),
+    Repeat   = factor(Repeat)
+  )
+
+# ── 2. Diversity metrics (rarefied) ──────────────────────────
+alpha_tbl <- phyloseq::estimate_richness(
+  ps_genus_rar, measures = c("Shannon", "Simpson", "Observed", "Chao1")
+) %>%
+  tibble::rownames_to_column("SampleID")
+
+# ── 3. Merge ──────────────────────────────────────────────────
+alpha_div <- dplyr::left_join(meta, alpha_tbl, by = "SampleID")
+
+# ── 4. Check raw distributions ────────────────────────────────
+par(mfrow = c(2, 2))
+hist(alpha_div$Shannon,  main = "Shannon",  breaks = 10, col = "#66C2A5")
+hist(alpha_div$Observed, main = "Observed", breaks = 10, col = "#66C2A5")
+hist(alpha_div$Chao1,    main = "Chao1",    breaks = 10, col = "#66C2A5")
+hist(alpha_div$Simpson,  main = "Simpson",  breaks = 10, col = "#66C2A5")
+par(mfrow = c(1, 1))
+
+# ── 5. Transformations ────────────────────────────────────────
+# Five scales considered per metric:
+#   raw, log (log+epsilon), sqrt, logit (Simpson only)
+# NOTE: AIC is not comparable across response scales — it is used within
+# each scale to choose additive vs interaction. Shapiro-Wilk and Q-Q plots
+# are then used across scales to identify the best-fitting transformation.
+
+safe_log   <- function(x) log(x + 1e-6)
+safe_logit <- function(x) log((x + 1e-6) / (1 - x + 1e-6))
+
+alpha_div <- alpha_div %>%
+  dplyr::mutate(
+    log_Shannon   = safe_log(Shannon),
+    sqrt_Shannon  = sqrt(Shannon),
+    log_Observed  = safe_log(Observed),
+    sqrt_Observed = sqrt(Observed),
+    log_Chao1     = safe_log(Chao1),
+    sqrt_Chao1    = sqrt(Chao1),
+    logit_Simpson = safe_logit(Simpson),
+    sqrt_Simpson  = sqrt(Simpson)
+  )
+
+# ── 6. Fit all candidate models ───────────────────────────────
+# Shannon
+mod_shannon_raw_add  <- lm(Shannon      ~ Genotype + Depth, data = alpha_div)
+mod_shannon_raw_int  <- lm(Shannon      ~ Genotype * Depth, data = alpha_div)
+mod_shannon_log_add  <- lm(log_Shannon  ~ Genotype + Depth, data = alpha_div)
+mod_shannon_log_int  <- lm(log_Shannon  ~ Genotype * Depth, data = alpha_div)
+mod_shannon_sqrt_add <- lm(sqrt_Shannon ~ Genotype + Depth, data = alpha_div)
+mod_shannon_sqrt_int <- lm(sqrt_Shannon ~ Genotype * Depth, data = alpha_div)
+
+# Observed
+mod_observed_raw_add  <- lm(Observed      ~ Genotype + Depth, data = alpha_div)
+mod_observed_raw_int  <- lm(Observed      ~ Genotype * Depth, data = alpha_div)
+mod_observed_log_add  <- lm(log_Observed  ~ Genotype + Depth, data = alpha_div)
+mod_observed_log_int  <- lm(log_Observed  ~ Genotype * Depth, data = alpha_div)
+mod_observed_sqrt_add <- lm(sqrt_Observed ~ Genotype + Depth, data = alpha_div)
+mod_observed_sqrt_int <- lm(sqrt_Observed ~ Genotype * Depth, data = alpha_div)
+
+# Chao1
+mod_chao1_raw_add  <- lm(Chao1      ~ Genotype + Depth, data = alpha_div)
+mod_chao1_raw_int  <- lm(Chao1      ~ Genotype * Depth, data = alpha_div)
+mod_chao1_log_add  <- lm(log_Chao1  ~ Genotype + Depth, data = alpha_div)
+mod_chao1_log_int  <- lm(log_Chao1  ~ Genotype * Depth, data = alpha_div)
+mod_chao1_sqrt_add <- lm(sqrt_Chao1 ~ Genotype + Depth, data = alpha_div)
+mod_chao1_sqrt_int <- lm(sqrt_Chao1 ~ Genotype * Depth, data = alpha_div)
+
+# Simpson — logit is theoretically preferred; sqrt included for completeness
+mod_simpson_raw_add   <- lm(Simpson       ~ Genotype + Depth, data = alpha_div)
+mod_simpson_raw_int   <- lm(Simpson       ~ Genotype * Depth, data = alpha_div)
+mod_simpson_logit_add <- lm(logit_Simpson ~ Genotype + Depth, data = alpha_div)
+mod_simpson_logit_int <- lm(logit_Simpson ~ Genotype * Depth, data = alpha_div)
+mod_simpson_sqrt_add  <- lm(sqrt_Simpson  ~ Genotype + Depth, data = alpha_div)
+mod_simpson_sqrt_int  <- lm(sqrt_Simpson  ~ Genotype * Depth, data = alpha_div)
+
+# ── 7. Residual diagnostics across ALL candidates ─────────────
+# Run before model selection so that a model excluded by AIC but with
+# better residual structure can be identified and manually preferred.
+
+all_candidates <- list(
+  shannon_raw_add  = mod_shannon_raw_add,
+  shannon_raw_int  = mod_shannon_raw_int,
+  shannon_log_add  = mod_shannon_log_add,
+  shannon_log_int  = mod_shannon_log_int,
+  shannon_sqrt_add = mod_shannon_sqrt_add,
+  shannon_sqrt_int = mod_shannon_sqrt_int,
+
+  observed_raw_add  = mod_observed_raw_add,
+  observed_raw_int  = mod_observed_raw_int,
+  observed_log_add  = mod_observed_log_add,
+  observed_log_int  = mod_observed_log_int,
+  observed_sqrt_add = mod_observed_sqrt_add,
+  observed_sqrt_int = mod_observed_sqrt_int,
+
+  chao1_raw_add  = mod_chao1_raw_add,
+  chao1_raw_int  = mod_chao1_raw_int,
+  chao1_log_add  = mod_chao1_log_add,
+  chao1_log_int  = mod_chao1_log_int,
+  chao1_sqrt_add = mod_chao1_sqrt_add,
+  chao1_sqrt_int = mod_chao1_sqrt_int,
+
+  simpson_raw_add   = mod_simpson_raw_add,
+  simpson_raw_int   = mod_simpson_raw_int,
+  simpson_logit_add = mod_simpson_logit_add,
+  simpson_logit_int = mod_simpson_logit_int,
+  simpson_sqrt_add  = mod_simpson_sqrt_add,
+  simpson_sqrt_int  = mod_simpson_sqrt_int
+)
+
+# Shapiro-Wilk summary table across all candidates
+shapiro_results <- data.frame(
+  Model   = names(all_candidates),
+  SW_W    = sapply(all_candidates, function(m) shapiro.test(residuals(m))$statistic),
+  SW_p    = sapply(all_candidates, function(m) shapiro.test(residuals(m))$p.value),
+  AIC_val = sapply(all_candidates, AIC)
+)
+shapiro_results$Normal_p05 <- shapiro_results$SW_p > 0.05
+
+cat("── Residual normality summary (all candidates) ──\n")
+print(shapiro_results, digits = 3)
+
+# Q-Q plots for all candidates — inspect visually
+for (nm in names(all_candidates)) {
+  par(mfrow = c(1, 2))
+  qqnorm(residuals(all_candidates[[nm]]), main = paste("Q-Q:", nm))
+  qqline(residuals(all_candidates[[nm]]), col = "red")
+  hist(residuals(all_candidates[[nm]]), breaks = 8,
+       main = paste("Resid:", nm), col = "#66C2A5", xlab = "Residuals")
+  par(mfrow = c(1, 1))
+}
+
+# ── 8. Select best model per metric ───────────────────────────
+# Primary criterion: Shapiro-Wilk p > 0.05 (residuals normal)
+# Secondary criterion: lowest AIC among models passing Shapiro-Wilk
+# If no model passes Shapiro-Wilk, select the one with highest SW W statistic
+# (closest to normal) and note this in interpretation.
+
+select_best <- function(candidate_names, sw_table) {
+  sub  <- sw_table[sw_table$Model %in% candidate_names, ]
+  pass <- sub[sub$Normal_p05 == TRUE, ]
+  if (nrow(pass) > 0) {
+    best_name <- pass$Model[which.min(pass$AIC_val)]
+    cat(sprintf("  → %s selected (passed Shapiro-Wilk, lowest AIC among passing models)\n",
+                best_name))
+  } else {
+    best_name <- sub$Model[which.max(sub$SW_W)]
+    cat(sprintf("  → %s selected (no model passed Shapiro-Wilk; best W statistic)\n",
+                best_name))
+  }
+  all_candidates[[best_name]]
+}
+
+cat("\n── Model selection ──\n")
+cat("Shannon:\n")
+mod_shannon  <- select_best(grep("^shannon",  names(all_candidates), value = TRUE),
+                            shapiro_results)
+cat("Observed:\n")
+mod_observed <- select_best(grep("^observed", names(all_candidates), value = TRUE),
+                            shapiro_results)
+cat("Chao1:\n")
+mod_chao1    <- select_best(grep("^chao1",    names(all_candidates), value = TRUE),
+                            shapiro_results)
+cat("Simpson:\n")
+mod_simpson  <- select_best(grep("^simpson",  names(all_candidates), value = TRUE),
+                            shapiro_results)
+
+cat("\n── Final model formulas ──\n")
+cat(sprintf("Shannon:  %s\n", deparse(formula(mod_shannon))))
+cat(sprintf("Observed: %s\n", deparse(formula(mod_observed))))
+cat(sprintf("Chao1:    %s\n", deparse(formula(mod_chao1))))
+cat(sprintf("Simpson:  %s\n", deparse(formula(mod_simpson))))
+
+# ── 9. Full residual plots for selected models ────────────────
+par(mfrow = c(2, 2))
+plot(mod_shannon);  par(mfrow = c(2, 2))
+plot(mod_observed); par(mfrow = c(2, 2))
+plot(mod_chao1);    par(mfrow = c(2, 2))
+plot(mod_simpson)
+par(mfrow = c(1, 1))
+
+# ── 10. ANOVA tables ──────────────────────────────────────────
+cat("\n── Shannon ANOVA ──\n");  print(Anova(mod_shannon,  type = "II"))
+cat("\n── Observed ANOVA ──\n"); print(Anova(mod_observed, type = "II"))
+cat("\n── Chao1 ANOVA ──\n");    print(Anova(mod_chao1,    type = "II"))
+cat("\n── Simpson ANOVA ──\n");  print(Anova(mod_simpson,  type = "II"))
+
+# ── 11. Effect sizes ──────────────────────────────────────────
+eta_squared(Anova(mod_shannon,  type = "II"), partial = FALSE, ci = 0.90)
+eta_squared(Anova(mod_observed, type = "II"), partial = FALSE, ci = 0.90)
+eta_squared(Anova(mod_chao1,    type = "II"), partial = FALSE, ci = 0.90)
+eta_squared(Anova(mod_simpson,  type = "II"), partial = FALSE, ci = 0.90)
+
+# ── 12. Pairwise comparisons ──────────────────────────────────
+pairs(emmeans(mod_shannon,  ~ Depth),    adjust = "sidak")
+pairs(emmeans(mod_shannon,  ~ Genotype), adjust = "sidak")
+pairs(emmeans(mod_observed, ~ Depth),    adjust = "sidak")
+pairs(emmeans(mod_observed, ~ Genotype), adjust = "sidak")
+pairs(emmeans(mod_chao1,    ~ Depth),    adjust = "sidak")
+pairs(emmeans(mod_chao1,    ~ Genotype), adjust = "sidak")
+pairs(emmeans(mod_simpson,  ~ Depth),    adjust = "sidak")
+pairs(emmeans(mod_simpson,  ~ Genotype), adjust = "sidak")
+
+# ── 13. Interaction cell contrasts ────────────────────────────
+for (metric in c("Shannon", "Observed", "Chao1", "Simpson")) {
+  mod <- get(paste0("mod_", tolower(metric)))
+  if (grepl("\\*", deparse(formula(mod)))) {
+    cat(sprintf("\n── %s: Depth within each Genotype ──\n", metric))
+    print(pairs(emmeans(mod, ~ Depth    | Genotype), adjust = "sidak"))
+    cat(sprintf("\n── %s: Genotype at each Depth ──\n", metric))
+    print(pairs(emmeans(mod, ~ Genotype | Depth),    adjust = "sidak"))
+  }
+}
+
+# Normality of residuals was assessed visually via Q-Q plots and confirmed with Shapiro-Wilk tests; where 
+# Shapiro-Wilk indicated significant departures (Chao1, Simpson), residual Q-Q plots showed only minor tail 
+# deviations consistent with ANOVA robustness at the study's sample size (n = 22).
+```
+
+## Differential abundance - which taxa drive differences
+
+```{r}
+# ── Setup ─────────────────────────────────────────────────────
+otu_mat_genus <- as(phyloseq::otu_table(ps_genus), "matrix")
+if (!phyloseq::taxa_are_rows(ps_genus)) otu_mat_genus <- t(otu_mat_genus)
+otu_mat_genus <- t(otu_mat_genus)  # vegan needs samples as rows
+
+meta_simper <- as(phyloseq::sample_data(ps_genus), "data.frame")
+meta_simper <- meta_simper[rownames(otu_mat_genus), ]
+
+# ── SIMPER by depth ───────────────────────────────────────────
+set.seed(123)
+simper_depth <- vegan::simper(otu_mat_genus, 
+                               group = meta_simper$Depth,
+                               permutations = 999)
+summary(simper_depth)
+
+# ── SIMPER by genotype ────────────────────────────────────────
+set.seed(123)
+simper_geno <- vegan::simper(otu_mat_genus, 
+                              group = meta_simper$Genotype,
+                              permutations = 999)
+summary(simper_geno)
+
+```
+
+## Assessing alpha diversity but excluding the four samples from Tsedey
+
+```{r}
+# ── FULL CHUNK: Filter out the 4 samples ────────────────────────
+exclude_samples <- c("barcode21.k2.0.1.gtdb.report", 
+                     "barcode14.k2.0.1.gtdb.report", 
+                     "barcode20.k2.0.1.gtdb.report", 
+                     "barcode22.k2.0.1.gtdb.report")
+
+# Filter phyloseq (equivalent to your subset_samples line)
+ps_genus_reduced <- prune_samples(!(sample_names(ps_genus) %in% exclude_samples), ps_genus)
+
+# ── 1. Extract metadata ───────────────────────────────────────
+meta <- as(sample_data(ps_genus_reduced), "data.frame") %>%
+  tibble::rownames_to_column("SampleID") %>%
+  dplyr::mutate(
+    Genotype = factor(Genotype),
+    Depth    = factor(Depth),
+    Repeat   = factor(Repeat)
+  )
+
+# ── 2. Diversity metrics (rarefied) ──────────────────────────
+alpha_tbl <- phyloseq::estimate_richness(
+  ps_genus_rar, measures = c("Shannon", "Simpson", "Observed", "Chao1")
+) %>%
+  tibble::rownames_to_column("SampleID")
+
+# ── 3. Merge ──────────────────────────────────────────────────
+alpha_div <- dplyr::left_join(meta, alpha_tbl, by = "SampleID")
+
+# ── 4. Check raw distributions ────────────────────────────────
+par(mfrow = c(2, 2))
+hist(alpha_div$Shannon,  main = "Shannon",  breaks = 10, col = "#66C2A5")
+hist(alpha_div$Observed, main = "Observed", breaks = 10, col = "#66C2A5")
+hist(alpha_div$Chao1,    main = "Chao1",    breaks = 10, col = "#66C2A5")
+hist(alpha_div$Simpson,  main = "Simpson",  breaks = 10, col = "#66C2A5")
+par(mfrow = c(1, 1))
+
+# ── 5. Transformations ────────────────────────────────────────
+# Five scales considered per metric:
+#   raw, log (log+epsilon), sqrt, logit (Simpson only)
+# NOTE: AIC is not comparable across response scales — it is used within
+# each scale to choose additive vs interaction. Shapiro-Wilk and Q-Q plots
+# are then used across scales to identify the best-fitting transformation.
+
+safe_log   <- function(x) log(x + 1e-6)
+safe_logit <- function(x) log((x + 1e-6) / (1 - x + 1e-6))
+
+alpha_div <- alpha_div %>%
+  dplyr::mutate(
+    log_Shannon   = safe_log(Shannon),
+    sqrt_Shannon  = sqrt(Shannon),
+    log_Observed  = safe_log(Observed),
+    sqrt_Observed = sqrt(Observed),
+    log_Chao1     = safe_log(Chao1),
+    sqrt_Chao1    = sqrt(Chao1),
+    logit_Simpson = safe_logit(Simpson),
+    sqrt_Simpson  = sqrt(Simpson)
+  )
+
+# ── 6. Fit all candidate models ───────────────────────────────
+# Shannon
+mod_shannon_raw_add  <- lm(Shannon      ~ Genotype + Depth, data = alpha_div)
+mod_shannon_raw_int  <- lm(Shannon      ~ Genotype * Depth, data = alpha_div)
+mod_shannon_log_add  <- lm(log_Shannon  ~ Genotype + Depth, data = alpha_div)
+mod_shannon_log_int  <- lm(log_Shannon  ~ Genotype * Depth, data = alpha_div)
+mod_shannon_sqrt_add <- lm(sqrt_Shannon ~ Genotype + Depth, data = alpha_div)
+mod_shannon_sqrt_int <- lm(sqrt_Shannon ~ Genotype * Depth, data = alpha_div)
+
+# Observed
+mod_observed_raw_add  <- lm(Observed      ~ Genotype + Depth, data = alpha_div)
+mod_observed_raw_int  <- lm(Observed      ~ Genotype * Depth, data = alpha_div)
+mod_observed_log_add  <- lm(log_Observed  ~ Genotype + Depth, data = alpha_div)
+mod_observed_log_int  <- lm(log_Observed  ~ Genotype * Depth, data = alpha_div)
+mod_observed_sqrt_add <- lm(sqrt_Observed ~ Genotype + Depth, data = alpha_div)
+mod_observed_sqrt_int <- lm(sqrt_Observed ~ Genotype * Depth, data = alpha_div)
+
+# Chao1
+mod_chao1_raw_add  <- lm(Chao1      ~ Genotype + Depth, data = alpha_div)
+mod_chao1_raw_int  <- lm(Chao1      ~ Genotype * Depth, data = alpha_div)
+mod_chao1_log_add  <- lm(log_Chao1  ~ Genotype + Depth, data = alpha_div)
+mod_chao1_log_int  <- lm(log_Chao1  ~ Genotype * Depth, data = alpha_div)
+mod_chao1_sqrt_add <- lm(sqrt_Chao1 ~ Genotype + Depth, data = alpha_div)
+mod_chao1_sqrt_int <- lm(sqrt_Chao1 ~ Genotype * Depth, data = alpha_div)
+
+# Simpson — logit is theoretically preferred; sqrt included for completeness
+mod_simpson_raw_add   <- lm(Simpson       ~ Genotype + Depth, data = alpha_div)
+mod_simpson_raw_int   <- lm(Simpson       ~ Genotype * Depth, data = alpha_div)
+mod_simpson_logit_add <- lm(logit_Simpson ~ Genotype + Depth, data = alpha_div)
+mod_simpson_logit_int <- lm(logit_Simpson ~ Genotype * Depth, data = alpha_div)
+mod_simpson_sqrt_add  <- lm(sqrt_Simpson  ~ Genotype + Depth, data = alpha_div)
+mod_simpson_sqrt_int  <- lm(sqrt_Simpson  ~ Genotype * Depth, data = alpha_div)
+
+# ── 7. Residual diagnostics across ALL candidates ─────────────
+# Run before model selection so that a model excluded by AIC but with
+# better residual structure can be identified and manually preferred.
+
+all_candidates <- list(
+  shannon_raw_add  = mod_shannon_raw_add,
+  shannon_raw_int  = mod_shannon_raw_int,
+  shannon_log_add  = mod_shannon_log_add,
+  shannon_log_int  = mod_shannon_log_int,
+  shannon_sqrt_add = mod_shannon_sqrt_add,
+  shannon_sqrt_int = mod_shannon_sqrt_int,
+
+  observed_raw_add  = mod_observed_raw_add,
+  observed_raw_int  = mod_observed_raw_int,
+  observed_log_add  = mod_observed_log_add,
+  observed_log_int  = mod_observed_log_int,
+  observed_sqrt_add = mod_observed_sqrt_add,
+  observed_sqrt_int = mod_observed_sqrt_int,
+
+  chao1_raw_add  = mod_chao1_raw_add,
+  chao1_raw_int  = mod_chao1_raw_int,
+  chao1_log_add  = mod_chao1_log_add,
+  chao1_log_int  = mod_chao1_log_int,
+  chao1_sqrt_add = mod_chao1_sqrt_add,
+  chao1_sqrt_int = mod_chao1_sqrt_int,
+
+  simpson_raw_add   = mod_simpson_raw_add,
+  simpson_raw_int   = mod_simpson_raw_int,
+  simpson_logit_add = mod_simpson_logit_add,
+  simpson_logit_int = mod_simpson_logit_int,
+  simpson_sqrt_add  = mod_simpson_sqrt_add,
+  simpson_sqrt_int  = mod_simpson_sqrt_int
+)
+
+# Shapiro-Wilk summary table across all candidates
+shapiro_results <- data.frame(
+  Model   = names(all_candidates),
+  SW_W    = sapply(all_candidates, function(m) shapiro.test(residuals(m))$statistic),
+  SW_p    = sapply(all_candidates, function(m) shapiro.test(residuals(m))$p.value),
+  AIC_val = sapply(all_candidates, AIC)
+)
+shapiro_results$Normal_p05 <- shapiro_results$SW_p > 0.05
+
+cat("── Residual normality summary (all candidates) ──\n")
+print(shapiro_results, digits = 3)
+
+# Q-Q plots for all candidates — inspect visually
+for (nm in names(all_candidates)) {
+  par(mfrow = c(1, 2))
+  qqnorm(residuals(all_candidates[[nm]]), main = paste("Q-Q:", nm))
+  qqline(residuals(all_candidates[[nm]]), col = "red")
+  hist(residuals(all_candidates[[nm]]), breaks = 8,
+       main = paste("Resid:", nm), col = "#66C2A5", xlab = "Residuals")
+  par(mfrow = c(1, 1))
+}
+
+# ── 8. Select best model per metric ───────────────────────────
+# Primary criterion: Shapiro-Wilk p > 0.05 (residuals normal)
+# Secondary criterion: lowest AIC among models passing Shapiro-Wilk
+# If no model passes Shapiro-Wilk, select the one with highest SW W statistic
+# (closest to normal) and note this in interpretation.
+
+select_best <- function(candidate_names, sw_table) {
+  sub  <- sw_table[sw_table$Model %in% candidate_names, ]
+  pass <- sub[sub$Normal_p05 == TRUE, ]
+  if (nrow(pass) > 0) {
+    best_name <- pass$Model[which.min(pass$AIC_val)]
+    cat(sprintf("  → %s selected (passed Shapiro-Wilk, lowest AIC among passing models)\n",
+                best_name))
+  } else {
+    best_name <- sub$Model[which.max(sub$SW_W)]
+    cat(sprintf("  → %s selected (no model passed Shapiro-Wilk; best W statistic)\n",
+                best_name))
+  }
+  all_candidates[[best_name]]
+}
+
+cat("\n── Model selection ──\n")
+cat("Shannon:\n")
+mod_shannon  <- select_best(grep("^shannon",  names(all_candidates), value = TRUE),
+                            shapiro_results)
+cat("Observed:\n")
+mod_observed <- select_best(grep("^observed", names(all_candidates), value = TRUE),
+                            shapiro_results)
+cat("Chao1:\n")
+mod_chao1    <- select_best(grep("^chao1",    names(all_candidates), value = TRUE),
+                            shapiro_results)
+cat("Simpson:\n")
+mod_simpson  <- select_best(grep("^simpson",  names(all_candidates), value = TRUE),
+                            shapiro_results)
+
+cat("\n── Final model formulas ──\n")
+cat(sprintf("Shannon:  %s\n", deparse(formula(mod_shannon))))
+cat(sprintf("Observed: %s\n", deparse(formula(mod_observed))))
+cat(sprintf("Chao1:    %s\n", deparse(formula(mod_chao1))))
+cat(sprintf("Simpson:  %s\n", deparse(formula(mod_simpson))))
+
+# ── 9. Full residual plots for selected models ────────────────
+par(mfrow = c(2, 2))
+plot(mod_shannon);  par(mfrow = c(2, 2))
+plot(mod_observed); par(mfrow = c(2, 2))
+plot(mod_chao1);    par(mfrow = c(2, 2))
+plot(mod_simpson)
+par(mfrow = c(1, 1))
+
+# ── 10. ANOVA tables ──────────────────────────────────────────
+cat("\n── Shannon ANOVA ──\n");  print(Anova(mod_shannon,  type = "II"))
+cat("\n── Observed ANOVA ──\n"); print(Anova(mod_observed, type = "II"))
+cat("\n── Chao1 ANOVA ──\n");    print(Anova(mod_chao1,    type = "II"))
+cat("\n── Simpson ANOVA ──\n");  print(Anova(mod_simpson,  type = "II"))
+
+# ── 11. Effect sizes ──────────────────────────────────────────
+eta_squared(Anova(mod_shannon,  type = "II"), partial = FALSE, ci = 0.90)
+eta_squared(Anova(mod_observed, type = "II"), partial = FALSE, ci = 0.90)
+eta_squared(Anova(mod_chao1,    type = "II"), partial = FALSE, ci = 0.90)
+eta_squared(Anova(mod_simpson,  type = "II"), partial = FALSE, ci = 0.90)
+
+# ── 12. Pairwise comparisons ──────────────────────────────────
+pairs(emmeans(mod_shannon,  ~ Depth),    adjust = "sidak")
+pairs(emmeans(mod_shannon,  ~ Genotype), adjust = "sidak")
+pairs(emmeans(mod_observed, ~ Depth),    adjust = "sidak")
+pairs(emmeans(mod_observed, ~ Genotype), adjust = "sidak")
+pairs(emmeans(mod_chao1,    ~ Depth),    adjust = "sidak")
+pairs(emmeans(mod_chao1,    ~ Genotype), adjust = "sidak")
+pairs(emmeans(mod_simpson,  ~ Depth),    adjust = "sidak")
+pairs(emmeans(mod_simpson,  ~ Genotype), adjust = "sidak")
+
+# ── 13. Interaction cell contrasts ────────────────────────────
+for (metric in c("Shannon", "Observed", "Chao1", "Simpson")) {
+  mod <- get(paste0("mod_", tolower(metric)))
+  if (grepl("\\*", deparse(formula(mod)))) {
+    cat(sprintf("\n── %s: Depth within each Genotype ──\n", metric))
+    print(pairs(emmeans(mod, ~ Depth    | Genotype), adjust = "sidak"))
+    cat(sprintf("\n── %s: Genotype at each Depth ──\n", metric))
+    print(pairs(emmeans(mod, ~ Genotype | Depth),    adjust = "sidak"))
+  }
+}
+```
+
+## PERMANOVA analysis on whole phyloseq data at genus level
+
+```{r}
+# ── Beta Diversity & PERMANOVA ────────────────────────────────────────────
+# All models use by = "margin" (marginal/Type III-equivalent) so that each
+# term is tested after accounting for all other terms in the model.
+# This is the correct approach for a balanced two-factor design and ensures
+# results are directly comparable across additive and interaction models.
+# Note: adonis2 with by = "margin" tests the interaction term by comparing
+# the full model against the model without that term — this is valid but
+# consumes degrees of freedom, so interpret the interaction with caution
+# given n = 22.
+
+# ── 1. Compute distances ──────────────────────────────────────────────────
+braydist      <- phyloseq::distance(ps_genus,     method = "bray")
+aitchisondist <- phyloseq::distance(ps_genus_clr, method = "euclidean")
+
+meta <- as(sample_data(ps_genus), "data.frame") %>%
+  dplyr::mutate(Genotype  = factor(Genotype),
+                Depth     = factor(Depth),
+                GenoDepth = interaction(Genotype, Depth))
+meta <- meta[labels(braydist), ]
+
+# ── 2. Betadisper ─────────────────────────────────────────────────────────
+cat("Betadisper — Genotype\n")
+print(permutest(betadisper(braydist, meta$Genotype), permutations = 999))
+
+# Beta dispersion differs significantly for genotype - assumption violated for bray-curtis so use Aitchison distance
+
+cat("\nBetadisper — Depth\n")
+print(permutest(betadisper(braydist, meta$Depth), permutations = 999))
+
+cat("\nBetadisper — Genotype:Depth\n")
+print(permutest(betadisper(braydist, meta$GenoDepth), permutations = 999))
+
+# ── 3. PERMANOVA additive (primary) ───────────────────────────────────────
+cat("\nPERMANOVA Bray-Curtis — Additive\n")
+set.seed(123)
+print(adonis2(braydist ~ Genotype + Depth, data = meta,
+              permutations = 999, by = "margin"))
+
+cat("\nPERMANOVA Aitchison — Additive\n")
+set.seed(123)
+print(adonis2(aitchisondist ~ Genotype + Depth, data = meta,
+              permutations = 999, by = "margin"))
+
+# ── 4. PERMANOVA interaction (exploratory) ────────────────────────────────
+cat("\nPERMANOVA Bray-Curtis — Interaction (exploratory)\n")
+set.seed(123)
+print(adonis2(braydist ~ Genotype * Depth, data = meta,
+              permutations = 999, by = "margin"))
+
+cat("\nPERMANOVA Aitchison — Interaction (exploratory)\n")
+set.seed(123)
+print(adonis2(aitchisondist ~ Genotype * Depth, data = meta,
+              permutations = 999, by = "margin"))
+
+# ── 5. Pairwise depth comparisons with Bonferroni correction ─────────────
+bray_mat <- as.matrix(braydist)
+
+run_pairwise <- function(d1, d2) {
+  m <- meta[meta$Depth %in% c(d1, d2), ]
+  m$Depth <- factor(m$Depth)
+  d <- as.dist(bray_mat[rownames(m), rownames(m)])
+  set.seed(123)
+  res <- adonis2(d ~ Depth, data = m, permutations = 999, by = "margin")
+  res["Depth", "Pr(>F)"]
+}
+
+p_raw <- c(
+  "Base vs Mid-section" = run_pairwise("Base", "Mid-section"),
+  "Base vs Tip"         = run_pairwise("Base", "Tip"),
+  "Mid-section vs Tip"  = run_pairwise("Mid-section", "Tip")
+)
+p_bonf <- pmin(p_raw * length(p_raw), 1)
+
+cat("\nPairwise depth PERMANOVA (Bonferroni corrected):\n")
+print(data.frame(
+  p_raw        = round(p_raw,  4),
+  p_bonferroni = round(p_bonf, 4),
+  significant  = p_bonf < 0.05
+))
+
+# ── 6. Genotype PERMANOVA within each depth ───────────────────────────────
+for (depth_level in levels(meta$Depth)) {
+  cat(sprintf("\nGenotype PERMANOVA at depth: %s\n", depth_level))
+  ps_sub   <- phyloseq::subset_samples(ps_genus, Depth == depth_level)
+  bray_sub <- phyloseq::distance(ps_sub, method = "bray")
+  meta_sub <- as(sample_data(ps_sub), "data.frame") %>%
+    dplyr::mutate(Genotype = factor(Genotype))
+  meta_sub <- meta_sub[labels(bray_sub), ]
+  print(table(meta_sub$Genotype))
+  if (any(table(meta_sub$Genotype) < 2)) { cat("Skipping.\n"); next }
+  set.seed(123)
+  print(adonis2(bray_sub ~ Genotype, data = meta_sub,
+                permutations = 999, by = "margin"))
+}
+
+```
+
+## PERMANOVA excluding four contaminated samples
+
+```{r}
+# ── Beta Diversity & PERMANOVA (REDUCED DATASET) ─────────────────────────
+# Excludes 4 potentially contaminated samples for robustness check
+# Same structure as original analysis
+
+# ── 1. Filter contaminated samples from ALL objects ──────────────────────
+exclude_samples <- c("barcode21.k2.0.1.gtdb.report", 
+                     "barcode14.k2.0.1.gtdb.report", 
+                     "barcode20.k2.0.1.gtdb.report", 
+                     "barcode22.k2.0.1.gtdb.report")
+
+ps_genus_red     <- prune_samples(!(sample_names(ps_genus)     %in% exclude_samples), ps_genus)
+ps_genus_clr_red <- prune_samples(!(sample_names(ps_genus_clr) %in% exclude_samples), ps_genus_clr)
+
+cat(sprintf("Samples: original = %d → reduced = %d\n", nsamples(ps_genus), nsamples(ps_genus_red)))
+
+# ── 2. Compute distances on REDUCED data ────────────────────────────────
+braydist_red      <- phyloseq::distance(ps_genus_red,     method = "bray")
+aitchisondist_red <- phyloseq::distance(ps_genus_clr_red, method = "euclidean")
+
+# ── 3. Extract metadata from REDUCED genus object ───────────────────────
+meta_red <- as(sample_data(ps_genus_red), "data.frame") %>%
+  dplyr::mutate(
+    Genotype  = factor(Genotype),
+    Depth     = factor(Depth),
+    GenoDepth = interaction(Genotype, Depth)
+  )
+meta_red <- meta_red[labels(braydist_red), ]
+
+# ── 4. Betadisper (homogeneity of dispersion) — REDUCED ──────────────────
+cat("Betadisper — Genotype (REDUCED)\n")
+print(permutest(betadisper(braydist_red, meta_red$Genotype), permutations = 999))
+
+cat("\nBetadisper — Depth (REDUCED)\n")
+print(permutest(betadisper(braydist_red, meta_red$Depth), permutations = 999))
+
+cat("\nBetadisper — Genotype:Depth (REDUCED)\n")
+print(permutest(betadisper(braydist_red, meta_red$GenoDepth), permutations = 999))
+
+# ── 5. PERMANOVA additive (primary) — REDUCED ───────────────────────────
+cat("\nPERMANOVA Bray-Curtis — Additive (REDUCED)\n")
+set.seed(123)
+print(adonis2(braydist_red ~ Genotype + Depth, data = meta_red,
+              permutations = 999, by = "margin"))
+
+cat("\nPERMANOVA Aitchison — Additive (REDUCED)\n")
+set.seed(123)
+print(adonis2(aitchisondist_red ~ Genotype + Depth, data = meta_red,
+              permutations = 999, by = "margin"))
+
+# ── 6. PERMANOVA interaction (exploratory) — REDUCED ─────────────────────
+cat("\nPERMANOVA Bray-Curtis — Interaction (REDUCED)\n")
+set.seed(123)
+print(adonis2(braydist_red ~ Genotype * Depth, data = meta_red,
+              permutations = 999, by = "margin"))
+
+cat("\nPERMANOVA Aitchison — Interaction (REDUCED)\n")
+set.seed(123)
+print(adonis2(aitchisondist_red ~ Genotype * Depth, data = meta_red,
+              permutations = 999, by = "margin"))
+
+# ── 7. Pairwise depth comparisons (Bonferroni) — REDUCED ─────────────────
+bray_mat_red <- as.matrix(braydist_red)
+
+run_pairwise_red <- function(d1, d2) {
+  m <- meta_red[meta_red$Depth %in% c(d1, d2), ]
+  m$Depth <- factor(m$Depth)
+  d <- as.dist(bray_mat_red[rownames(m), rownames(m)])
+  set.seed(123)
+  res <- adonis2(d ~ Depth, data = m, permutations = 999, by = "margin")
+  res["Depth", "Pr(>F)"]
+}
+
+p_raw_red <- c(
+  "Base vs Mid-section" = run_pairwise_red("Base", "Mid-section"),
+  "Base vs Tip"         = run_pairwise_red("Base", "Tip"),
+  "Mid-section vs Tip"  = run_pairwise_red("Mid-section", "Tip")
+)
+p_bonf_red <- pmin(p_raw_red * length(p_raw_red), 1)
+
+cat("\nPairwise depth PERMANOVA — REDUCED (Bonferroni):\n")
+print(data.frame(
+  Comparison     = names(p_raw_red),
+  p_raw          = round(p_raw_red, 4),
+  p_bonferroni   = round(p_bonf_red, 4),
+  significant    = p_bonf_red < 0.05
+))
+
+# ── 8. Genotype PERMANOVA within each depth — REDUCED ────────────────────
+for (depth_level in levels(meta_red$Depth)) {
+  cat(sprintf("\nGenotype PERMANOVA at %s (REDUCED):\n", depth_level))
+  ps_sub   <- phyloseq::subset_samples(ps_genus_red, Depth == depth_level)
+  bray_sub <- phyloseq::distance(ps_sub, method = "bray")
+  meta_sub <- as(sample_data(ps_sub), "data.frame") %>%
+    dplyr::mutate(Genotype = factor(Genotype))
+  meta_sub <- meta_sub[labels(bray_sub), ]
+  print(table(meta_sub$Genotype))
+  if (any(table(meta_sub$Genotype) < 2)) { 
+    cat("  → Skipping (insufficient replication)\n"); 
+    next 
+  }
+  set.seed(123)
+  print(adonis2(bray_sub ~ Genotype, data = meta_sub,
+                permutations = 999, by = "margin"))
+}
+
+cat("\n────────────────────────────────────────────────────────\n")
+cat("SUMMARY: All tests repeated excluding 4 potentially contaminated samples\n")
+cat("Original n = 24 → Reduced n =", nsamples(ps_genus_red), "\n")
+```
+
+## Identifying taxa characteristic of a specific genotype or depth
+
+```{r}
+library(indicspecies)
+
+otu_df <- as.data.frame(phyloseq::otu_table(ps_species))
+if (!phyloseq::taxa_are_rows(ps_species)) otu_df <- t(otu_df)
+
+meta_ind <- as(phyloseq::sample_data(ps_species), "data.frame")
+meta_ind <- meta_ind[colnames(otu_df), ]
+
+# ── By genotype ───────────────────────────────────────────────
+indval_genotype <- indicspecies::multipatt(
+  t(otu_df),
+  meta_ind$Genotype,
+  control = permute::how(nperm = 999)
+)
+summary(indval_genotype, alpha = 0.05)
+
+# ── Genotype indicator species taxonomy ───────────────────────
+# Dabbi:  OTU4659 (PCC-6304), OTU3255 (Fluviicola), OTU7398 (Pseudoduganella)
+# Tsedey: OTU705 (SCMT01), OTU298 (Undibacterium)
+indicator_otus_genotype <- data.frame(
+  OTU   = c("OTU4659", "OTU3255", "OTU7398", "OTU705",  "OTU298"),
+  Group = c("Dabbi",   "Dabbi",   "Dabbi",   "Tsedey",  "Tsedey")
+)
+
+indicator_taxa_genotype <- phyloseq::tax_table(ps_species) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("OTU") %>%
+  dplyr::filter(OTU %in% indicator_otus_genotype$OTU) %>%
+  dplyr::left_join(indicator_otus_genotype, by = "OTU")
+
+cat("── Genotype indicator species taxonomy ──\n")
+print(indicator_taxa_genotype)
+
+# ── By depth ──────────────────────────────────────────────────
+indval_depth <- indicspecies::multipatt(
+  t(otu_df),
+  meta_ind$Depth,
+  control = permute::how(nperm = 999)
+)
+summary(indval_depth, alpha = 0.05)
+
+# ── Depth indicator species taxonomy ─────────────────────────
+# Tip only:          OTU7398 (Pseudoduganella)
+# Mid-section + Tip: OTU1614 (Novosphingobium), OTU5995 (Asticcacaulis),
+#                    OTU2193 (Nocardioides), OTU5169 (Deinococcus)
+indicator_otus_depth <- data.frame(
+  OTU   = c("OTU7398", "OTU1614",           "OTU5995",           "OTU2193",           "OTU5169"),
+  Group = c("Tip",     "Mid-section + Tip", "Mid-section + Tip", "Mid-section + Tip", "Mid-section + Tip")
+)
+
+indicator_taxa_depth <- phyloseq::tax_table(ps_species) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("OTU") %>%
+  dplyr::filter(OTU %in% indicator_otus_depth$OTU) %>%
+  dplyr::left_join(indicator_otus_depth, by = "OTU")
+
+cat("── Depth indicator species taxonomy ──\n")
+print(indicator_taxa_depth)
+```
+
+## Indicator spcies genotype_depth
+
+```{r}
+library(indicspecies)
+
+# ─────────────────────────────────────────────────────────────
+# STEP 1: Prepare species-level data
+# ─────────────────────────────────────────────────────────────
+otu_df <- as.data.frame(phyloseq::otu_table(ps_species))
+if (!phyloseq::taxa_are_rows(ps_species)) {
+  otu_df <- t(otu_df)  # Rows = samples, columns = OTUs
+}
+
+meta_ind <- as(phyloseq::sample_data(ps_species), "data.frame")
+meta_ind <- meta_ind[colnames(otu_df), ]  # Match sample order
+meta_ind$genotype_depth <- paste(meta_ind$Genotype, meta_ind$Depth, sep = "_")
+
+# ─────────────────────────────────────────────────────────────
+# STEP 2: Indicator species analysis
+# ─────────────────────────────────────────────────────────────
+results_list <- list()
+
+for (group_name in unique(meta_ind$genotype_depth)) {
+  cat(sprintf("\n── %s ──\n", group_name))
+  
+  # Binary grouping: THIS group vs all others
+  group_binary <- meta_ind$genotype_depth == group_name
+  
+  # IndVal analysis
+  indval_single <- indicspecies::multipatt(
+    t(otu_df),
+    group_binary,
+    control = permute::how(nperm = 999)
+  )
+  
+  # All significant OTUs (p < 0.05)
+  sig_indicators <- summary(indval_single, alpha = 0.05)$sign
+  
+  if (is.null(sig_indicators) || nrow(sig_indicators) == 0) {
+    cat("  → No significant OTUs\n")
+    next
+  }
+  
+  # Store ALL significant results for this group
+  results_list[[group_name]] <- sig_indicators
+  cat(sprintf("  → %d significant OTUs (p < 0.05)\n", nrow(sig_indicators)))
+  print(head(sig_indicators[, c("stat", "p.value")], 3))
+}
+
+# ─────────────────────────────────────────────────────────────
+# STEP 3: Summary table of OTUs per group
+# ─────────────────────────────────────────────────────────────
+cat("\n── SUMMARY: OTUs per genotype-depth ──\n")
+otu_summary <- data.frame(
+  Group = names(results_list),
+  N_OTUs = sapply(results_list, nrow),
+  Top_OTUs = sapply(results_list, function(x) {
+    paste(head(rownames(x[order(x$stat, decreasing = TRUE), ]), 2), collapse = ", ")
+  })
+)
+print(otu_summary)
+
+# ── OUTPUT: Save OTU list for taxonomy lookup ───────────────────────────
+all_sig_otus <- unique(unlist(lapply(results_list, rownames)))
+cat("\n── ALL SIGNIFICANT OTUs (copy to taxonomy chunk) ──\n")
+cat(paste('"', all_sig_otus, '"', collapse = ", "), "\n")
+cat(sprintf("\nTotal unique OTUs: %d\n", length(all_sig_otus)))
+
+cat("\nNOTE: Run taxonomy lookup on these OTUs in separate chunk.\n")
+```
+
+## Finding identity of OTUs identified
+
+```{r}
+# ── IDENTIFY ALL SIGNIFICANT OTUs from your analysis ──────────────────────
+# These are the 11 OTUs `multipatt()` flagged as significant (p < 0.05)
+
+significant_otus <- c("OTU5995", "OTU5169", "OTU298", "OTU3255", 
+                      "OTU705", "OTU7398", "OTU3239", "OTU1614", 
+                      "OTU816", "OTU766")
+
+# ── Extract taxonomy for THESE specific OTUs ─────────────────────────────
+tax_table_subset <- phyloseq::tax_table(ps_species)[significant_otus, ]
+
+# Convert to readable format
+otu_taxonomy <- as.data.frame(tax_table_subset) %>%
+  tibble::rownames_to_column("OTU") %>%
+  dplyr::select(OTU, Genus, Species) %>%
+  dplyr::mutate(
+    Species_name = ifelse(
+      is.na(Species) | Species == "",
+      paste(Genus, "sp."),
+      Species
+    )
+  ) %>%
+  dplyr::arrange(OTU)
+
+cat("── IDENTITIES OF YOUR 11 SIGNIFICANT INDICATOR OTUs ──\n")
+print(otu_taxonomy)
+
+# ── Summary of habitat associations ──────────────────────────────────────
+cat("\n── BIOLOGICAL INTERPRETATION ──\n")
+
+# Dabbi_Base specialists
+dabbi_base <- c("OTU5995", "OTU5169", "OTU298", "OTU3255")
+cat("**Dabbi_Base specialists:**\n")
+print(otu_taxonomy[otu_taxonomy$OTU %in% dabbi_base, "Species_name"])
+
+# Dabbi_Tip specialists  
+dabbi_tip <- c("OTU7398", "OTU3239", "OTU1614", "OTU5995")
+cat("\n**Dabbi_Tip specialists:**\n")
+print(otu_taxonomy[otu_taxonomy$OTU %in% dabbi_tip, "Species_name"])
+
+# Tsedey_Mid-section
+tsedey_mid <- "OTU816"
+cat("\n**Tsedey_Mid-section:**\n")
+print(otu_taxonomy[otu_taxonomy$OTU %in% tsedey_mid, "Species_name"])
+
+# Tsedey_Tip
+tsedey_tip <- "OTU766"
+cat("\n**Tsedey_Tip:**\n")
+print(otu_taxonomy[otu_taxonomy$OTU %in% tsedey_tip, "Species_name"])
+```
+
+## Rarefaction curve to see if sequencing depth was sufficient to find all species (by depth)
+
+```{r fig.width=10, fig.height=8, dpi=300}
+# ── 1. Extract OTU table ──────────────────────────────────────
+otu_mat_counts <- as(phyloseq::otu_table(ps), "matrix")
+if (phyloseq::taxa_are_rows(ps)) otu_mat_counts <- t(otu_mat_counts)
+
+# ── 2. Build palette dynamically to match number of depth levels ─
+depth_levels  <- levels(factor(phyloseq::sample_data(ps)$Depth))
+n_depths      <- length(depth_levels)
+depth_palette <- RColorBrewer::brewer.pal(max(3, n_depths), "Set2")[1:n_depths]
+
+# ── 3. Map colours to samples ────────────────────────────────
+sample_colors <- depth_palette[as.numeric(factor(phyloseq::sample_data(ps)$Depth))]
+
+# ── 4. Plot rarefaction curves ────────────────────────────────
+vegan::rarecurve(
+  otu_mat_counts,
+  step  = 20,
+  col   = sample_colors,
+  lwd   = 1.5,
+  label = FALSE,
+  main  = "Rarefaction Curves by Depth",
+  xlab  = "Sequencing Depth (Reads)",
+  ylab  = "Observed Richness"
+)
+
+# ── 5. Legend ─────────────────────────────────────────────────
+legend(
+  "bottomright",
+  legend  = depth_levels,
+  col     = depth_palette,
+  lty     = 1,
+  lwd     = 3,
+  cex     = 0.8,
+  title   = "Depth",
+  box.lwd = 0
+)
+
+```
+
+# rarefaction by gentoype
+
+```{r fig.width=10, fig.height=8, dpi=300}
+# ── 1. Extract OTU table ──────────────────────────────────────
+otu_mat_counts <- as(phyloseq::otu_table(ps), "matrix")
+if (phyloseq::taxa_are_rows(ps)) otu_mat_counts <- t(otu_mat_counts)
+
+# ── 2. Build palette dynamically ─────────────────────────────
+geno_levels   <- levels(factor(phyloseq::sample_data(ps)$Genotype))
+n_geno        <- length(geno_levels)
+geno_palette  <- RColorBrewer::brewer.pal(max(3, n_geno), "Set2")[1:n_geno]
+
+# ── 3. Map colours to samples ─────────────────────────────────
+sample_colors <- geno_palette[as.numeric(factor(phyloseq::sample_data(ps)$Genotype))]
+
+# ── 4. Plot ───────────────────────────────────────────────────
+vegan::rarecurve(
+  otu_mat_counts,
+  step  = 20,
+  col   = sample_colors,
+  lwd   = 1.5,
+  label = FALSE,
+  main  = "Rarefaction Curves by Genotype",
+  xlab  = "Sequencing Depth (Reads)",
+  ylab  = "Observed Richness"
+)
+
+# ── 5. Legend ─────────────────────────────────────────────────
+legend(
+  "bottomright",
+  legend  = geno_levels,
+  col     = geno_palette,
+  lty     = 1,
+  lwd     = 3,
+  cex     = 0.8,
+  title   = "Genotype",
+  box.lwd = 0
+)
+
+```
