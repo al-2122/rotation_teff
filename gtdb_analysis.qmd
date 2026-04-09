@@ -1,6 +1,5 @@
 ---
 title: "teff_gtdb_analysis"
-format: html
 format: pdf
 editor: visual
 toc: TRUE

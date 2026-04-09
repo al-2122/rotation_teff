@@ -2,7 +2,6 @@
 title: "rsa_6week_soil_batch4"
 output: html_document
 date: "2026-03-12"
-format: html
 format: pdf
 editor: visual
 toc: TRUE
