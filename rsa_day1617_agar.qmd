@@ -1,0 +1,1779 @@
+---
+title: "RSA_day16_agar"
+author: "Alessandra Learmount"
+format: html
+editor: visual
+toc: TRUE
+date: "2026-03-03"
+---
+
+# Root Architecture Analysis of Day 16 Roots Grown on Agar
+
+Loading librairies, importing dataset and obtaining day, batch and genotype
+
+```{r}
+library(tidyverse)
+library(moments)
+library(lme4)
+library(emmeans)
+library(multcomp)
+library(multcompView)
+library(lmerTest)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(car)
+library(ggpubr)
+library(patchwork)
+library(performance)
+library(ggResidpanel)
+library(glmmTMB)
+library(DHARMa)
+library(performance)
+library(cld)
+
+df <- read.csv("~/Desktop/RStudio/teff_rotation_apr26/features_day1617.csv")
+
+# extract relevant data from teh csv file
+df <- df %>%
+  mutate(
+    ID            = str_remove(File.Name, "_seg\\.png"),
+    Day           = str_extract(File.Name, "D\\d+"),
+    Batch         = str_extract(File.Name, "B\\d+"),
+    Genotype      = str_extract(File.Name, "(?<=_B\\d_)[A-Z]+(?=P)"),
+    Plate         = str_extract(File.Name, "(?<=P)\\d+(?=S)"),
+    Seed          = str_extract(File.Name, "(?<=S)\\d+(?=_seg)"),
+    Genotype_Name = case_when(
+      Genotype == "A" ~ "Addisie",
+      Genotype == "B" ~ "Beten",
+      Genotype == "D" ~ "Dabbi",
+      Genotype == "K" ~ "Karadebi",
+      Genotype == "M" ~ "Manyi",
+      Genotype == "T" ~ "Tsedey",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+   # Explicitly coerce grouping variables to factors
+  mutate(
+    Genotype = factor(Genotype_Name),
+    Batch    = factor(Batch),
+    Plate    = factor(Plate)
+  ) %>%
+  # Drop any rows where key variables failed to parse
+  filter(!is.na(Genotype), !is.na(Batch), !is.na(Plate))
+
+
+head(df)
+```
+
+Overall visualisation and defining traits - bix panel boxplot
+
+```{r, fig.width=20, fig.height=12, dpi=300}
+key_traits <- c("Total.Root.Length.mm", "Median.Number.of.Roots", "Maximum.Number.of.Roots", "Maximum.Width.mm", "Depth.mm", "Number.of.Root.Tips",
+                "Average.Diameter.mm", "Maximum.Diameter.mm", "Width.to.Depth.Ratio",
+                "Network.Area.mm2", "Convex.Area.mm2", "Perimeter.mm", "Volume.mm3", "Surface.Area.mm2", "Average.Root.Orientation.deg",
+                "Steep.Angle.Frequency", "Shallow.Angle.Frequency", "Medium.Angle.Frequency", "Solidity", "Lower.Root.Area.mm2")
+
+df_long <- df %>% pivot_longer(all_of(key_traits), names_to = "Trait", values_to = "Value")
+
+head(df_long)
+
+ggplot(df_long, aes(x = Genotype, y = Value, fill = Genotype)) +
+  geom_boxplot(alpha = 0.6) +
+  geom_jitter(aes(colour = Batch), width = 0.15, size = 1.5) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_colour_brewer(palette = "Set2") +
+  facet_wrap(~Trait, scales = "free_y") +
+  theme_bw()
+
+```
+
+Overall, box plot suggests broadly simlar phenotypes across the species so will pick out individual traits to see if any significant differences do arise. 
+
+### Number of Root Tips
+
+Assessing each factor individually
+
+-   Assess type of data
+
+-   Decide best model
+
+-   Check assumptions
+
+-   Stats tests
+
+-   Plots
+
+```{r, fig.width=16, fig.height=12, dpi=400}
+# ============================================================
+#  Number of Root Tips Analysis
+# ============================================================
+
+# ── 1. Inspect distribution ───────────────────────────────────
+# Root tips is a non-negative integer count — must use a count
+# distribution (Poisson or NB), not Gaussian.
+summary(df$Number.of.Root.Tips)
+cat("Var/Mean ratio:", round(var(df$Number.of.Root.Tips) /
+      mean(df$Number.of.Root.Tips), 3),
+    "(>1 suggests overdispersion)\n")
+
+# Histogram to visualise shape and identify skew or zero-inflation
+ggplot(df, aes(x = Number.of.Root.Tips)) +
+  geom_histogram(binwidth = 3, fill = "#66C2A5", colour = "white") +
+  geom_vline(xintercept = mean(df$Number.of.Root.Tips),
+             linetype = "dashed", colour = "red") +
+  labs(x = "Number of root tips", y = "Count") +
+  theme_classic(base_size = 14)
+
+# ── 2. Fit Poisson to formally confirm overdispersion ─────────
+# We fit Poisson first to formally test whether its assumption
+# (variance = mean) holds. If DHARMa flags overdispersion
+# (p < 0.05, ratio >> 1), we reject Poisson and move to NB.
+# Random effects: seeds nested in plates nested in batches —
+# ignoring this clustering would pseudoreplicate as plants on
+# the same plate share physical and nutritional environment.
+tips_tmb_pois <- glmmTMB(
+  Number.of.Root.Tips ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, family = poisson
+)
+
+sim_pois <- simulateResiduals(tips_tmb_pois, n = 1000)
+plot(sim_pois)
+testDispersion(sim_pois)   # p < 0.05 → overdispersed → try NB to see if there is a better fit
+
+# the residual plots show from outlier test the deviation is significant so we will try NB
+
+# ── 3. Compare nb2 vs nb1 ─────────────────────────────────────
+# Two NB parameterisations:
+#   nb2: variance = mu + mu²/theta — quadratic, most common for
+#        biological count data where variance scales with mean²
+#   nb1: variance = phi*mu — linear, less common
+# Select using AIC (lower = better) and DHARMa visual diagnostics.
+
+tips_tmb_nb2 <- glmmTMB(
+  Number.of.Root.Tips ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, family = nbinom2
+)
+
+tips_tmb_nb1 <- glmmTMB(
+  Number.of.Root.Tips ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, family = nbinom1
+)
+
+# AIC comparison — lower = better fit penalised for complexity
+AIC(tips_tmb_pois, tips_tmb_nb1, tips_tmb_nb2)
+
+# find that NB2 is better than poisson and NB1 fails so will continue with NB2
+
+# DHARMa residuals for each NB model — choose the one with
+# better QQ alignment and flatter residual vs fitted panel
+sim_nb2 <- simulateResiduals(tips_tmb_nb2, n = 1000)
+plot(sim_nb2)
+
+# ── 4. Full assumption checks on chosen model (nb2) ───────────
+# testUniformity: residuals should be uniformly distributed (p > 0.05)
+# testDispersion: ratio ≈ 1.0 confirms variance correctly specified
+# testZeroInflation: checks if zeros are over-represented beyond NB
+# testOutliers: flags any observations with extreme residuals
+testUniformity(sim_nb2)
+testDispersion(sim_nb2)
+testZeroInflation(sim_nb2)
+testOutliers(sim_nb2)
+
+# residual plots show no significant deviation
+
+# ── 5. Random effects structure ───────────────────────────────
+VarCorr(tips_tmb_nb2)
+check_singularity(tips_tmb_nb2) 
+
+# ── 7. Test Genotype effect + pairwise comparisons ────────────
+# emmeans gives estimated marginal means on the count scale
+# (type = "response" back-transforms from log link).
+# sidak HSD controls family-wise error rate across all pairs.
+car::Anova(tips_tmb_nb2, type = "III")
+
+emm <- emmeans(tips_tmb_nb2, ~ Genotype, type = "response")
+pairs(emm, adjust = "sidak")
+
+cld_df <- as.data.frame(cld(emm, adjust = "sidak",
+                             Letters = letters, alpha = 0.05)) %>%
+  mutate(.group = trimws(.group))
+
+names(cld_df)[names(cld_df) %in% c("asymp.LCL", "lower.CL")] <- "LCL"
+names(cld_df)[names(cld_df) %in% c("asymp.UCL", "upper.CL")] <- "UCL"
+
+n_df <- df %>%
+  count(Genotype) %>%
+  mutate(label = paste0("n=", n))
+
+
+# Effect size
+
+# Cohen's d = difference in means / pooled SD
+# Interpretation: 0.2 = small, 0.5 = medium, 0.8 = large
+
+emm_tips <- emmeans(tips_tmb_nb2, ~ Genotype)
+
+eff_tips <- eff_size(
+  emm_tips,
+  sigma = sigma(tips_tmb_nb2),   # residual SD from model
+  edf   = df.residual(tips_tmb_nb2)
+)
+print(eff_tips)
+
+# all effect sizes are small 
+
+# Summary stats needed for bar chart
+bar_df <- df %>%
+  group_by(Genotype) %>%
+  summarise(mean_tips = mean(Number.of.Root.Tips),
+            se        = sd(Number.of.Root.Tips) / sqrt(n()),
+            .groups   = "drop")
+
+
+# ── 8. Plot 1 — Boxplot + jitter ─────────────────────────────
+# Boxplot shows full data distribution; jitter overlays raw points.
+# CLD letters indicate sidak groupings; shared letters = ns.
+# n labels below x-axis show sample sizes per genotype.
+y_ceil <- max(df$Number.of.Root.Tips) * 1.2
+y_label <- y_ceil * 0.86
+
+p1 <- ggplot(df, aes(x = Genotype, y = Number.of.Root.Tips, fill = Genotype)) +
+
+  geom_boxplot(
+    alpha         = 0.7,
+    outlier.shape = NA,
+    width         = 0.5,
+    colour        = "black",
+    linewidth     = 0.5
+  ) +
+
+  geom_jitter(
+    width  = 0.15,
+    size   = 1.8,
+    alpha  = 0.55,
+    colour = "black"
+  ) +
+
+  geom_text(
+    data        = cld_df,
+    aes(x = Genotype, label = .group),
+    y           = y_label,
+    inherit.aes = FALSE,
+    size        = 9,
+    fontface    = "bold",
+    colour      = "grey20"
+  ) +
+
+  geom_text(
+    data        = n_df,
+    aes(x = Genotype, label = label),
+    y           = -Inf,
+    vjust       = 4.2,
+    inherit.aes = FALSE,
+    size        = 6,
+    colour      = "grey40"
+  ) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x       = "Genotype",
+    y       = "Number of root tips",
+    caption = "Shared letters indicate no significant difference (sidak HSD, p > 0.05; glmmTMB, nbinom2). Bars show raw means ± SE."
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    panel.grid      = element_blank(),
+    axis.line       = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks      = element_line(colour = "black", linewidth = 0.5),
+    axis.title      = element_text(size = 26, face = "bold"),
+    axis.title.x    = element_text(size = 26, face = "bold", margin = margin(t = 24)),
+    axis.text       = element_text(size = 22, colour = "black"),
+    axis.text.x     = element_text(face = "italic", margin = margin(t = 15)),
+    plot.caption    = element_text(size = 12, colour = "grey40", hjust = 0, margin = margin(t = 10)),
+    plot.margin     = margin(t = 25, r = 25, b = 25, l = 25)
+  )
+
+p1 + coord_cartesian(clip = "off")
+
+# ── 9. Plot 2 — Bar chart (mean ± SE) ────────────────────────
+# Bar chart shows mean ± 1 SE per genotype with raw data overlaid.
+# SE bars give a sense of within-genotype variability.
+# Raw points overlaid for transparency — avoids hiding the spread.
+# CLD letters from the mixed model placed above bars.
+
+p2 <- ggplot(bar_df, aes(x = Genotype, y = mean_tips, fill = Genotype)) +
+
+  geom_col(
+    colour    = "black",
+    linewidth = 0.3,
+    width     = 0.5,
+    alpha     = 0.8555
+  ) +
+
+  geom_errorbar(
+    aes(ymin = mean_tips - se, ymax = mean_tips + se),
+    width     = 0.2,
+    linewidth = 0.3,
+    colour    = "black"
+  ) +
+
+  # Raw data overlaid for transparency
+  geom_jitter(
+    data   = df,
+    aes(x = Genotype, y = Number.of.Root.Tips),
+    width  = 0.15,
+    size   = 1.3,
+    alpha  = 0.55,
+    colour = "black",
+    inherit.aes = FALSE
+  ) +
+
+  geom_text(
+    data        = cld_df,
+    aes(x = Genotype, label = .group),
+    y           = max(df$Number.of.Root.Tips, na.rm = TRUE) * 1.02,
+    inherit.aes = FALSE,
+    size        = 5,
+    fontface    = "bold",
+    colour      = "grey20"
+  ) +
+
+  geom_text(
+    data        = n_df,
+    aes(x = Genotype, label = label),
+    y           = -Inf,
+    vjust       = 4.2,
+    inherit.aes = FALSE,
+    size        = 3.5,
+    colour      = "grey40"
+  ) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x       = "Genotype",
+    y       = "Number of root tips",
+    caption = "Bars = mean ± 1 SE; points = raw data\nShared letters indicate no significant difference (sidak HSD, p > 0.05; glmmTMB, nbinom2)"
+  ) +
+
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position = "none",
+    panel.grid      = element_blank(),
+    axis.line       = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks      = element_line(colour = "black", linewidth = 0.5),
+    axis.title      = element_text(size = 16, face = "bold"),
+    axis.text       = element_text(size = 16, colour = "black"),
+    axis.text.x     = element_text(face = "italic", margin = margin(t = 3)),
+    plot.caption    = element_text(size = 12, colour = "grey40", hjust = 0),
+    plot.margin     = margin(t = 10, r = 15, b = 30, l = 10)
+  )
+
+p2 + coord_cartesian(clip = "off")
+
+```
+
+### Average Root Diameter
+
+```{r, fig.width=16, fig.height=12, dpi=300}
+
+df %>%
+  group_by(Genotype) %>%
+  summarise(Mean     = round(mean(Average.Diameter.mm), 2),
+            Variance = round(var(Average.Diameter.mm),  2),
+            Var_Mean = round(var(Average.Diameter.mm) /
+                               mean(Average.Diameter.mm), 2))
+
+
+# Histogram
+ggplot(df, aes(x = Average.Diameter.mm)) +
+  geom_histogram(bins = 15, fill = "#66C2A5", colour = "white") +
+  labs(title = "Distribution of Average Root Diameter",
+       x = "Average Diameter (mm)", y = "Count") +
+  theme_bw()
+
+# ── Original model (Batch/Plate/Seed nested shorthand) ───────
+# R expands this into THREE separate variance components:
+# (1|Batch) + (1|Batch:Plate) + (1|Batch:Plate:Seed)
+
+diam_tmb_full <- glmmTMB(
+  Average.Diameter.mm ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, family = gaussian()
+)
+
+# Inspect variance components
+VarCorr(diam_tmb_full)
+check_singularity(diam_tmb_full) 
+
+
+# Because Plate and Batch variances collapse to ~0, the Hessian
+# matrix becomes singular and all SEs are uncomputable:
+
+# ── Fit reduced models for best fit ─────────────────────────────────────────────────
+diam_tmb <- glmmTMB(
+  Average.Diameter.mm ~ Genotype + (1 | Batch/Plate),
+  data = df, family = gaussian()
+)
+
+VarCorr(diam_tmb)
+check_singularity(diam_tmb) 
+
+# ── Assumption checks ─────────────────────────────────────────
+sim_res <- simulateResiduals(diam_tmb, n = 1000)
+plot(sim_res)                                  # QQ + residuals vs fitted
+testUniformity(sim_res)                        # p > 0.05 = Gaussian appropriate
+testDispersion(sim_res)                        # ratio ≈ 1.0 = variance correct
+plotResiduals(sim_res, form = df$Genotype)     # no patterns per genotype
+
+# residual fits are all good so happy to continue with this model 
+
+# ── Test overall Genotype effect ──────────────────────────────
+car::Anova(diam_tmb, type = "III")
+
+# ── Pairwise comparisons + CLD ────────────────────────────────
+emm       <- emmeans(diam_tmb, ~ Genotype)
+pairs(emm, adjust = "sidak")
+
+cld_df <- as.data.frame(cld(emm, adjust = "sidak",
+                             Letters = letters, alpha = 0.05)) %>%
+  mutate(.group = trimws(.group))
+
+
+# Cohen's d = difference in means / pooled SD
+# Interpretation: 0.2 = small, 0.5 = medium, 0.8 = large
+
+emm_diam <- emmeans(diam_tmb, ~ Genotype)
+
+eff_diam <- eff_size(
+  emm_diam,
+  sigma = sigma(diam_tmb),   # residual SD from model
+  edf   = df.residual(diam_tmb)
+)
+print(eff_diam)
+
+# most effect sizes are relatively small
+
+# ── Sample size labels ────────────────────────────────────────
+n_df <- df %>%
+  count(Genotype) %>%
+  mutate(label = paste0("n=", n))
+
+# ── CLD letter position (above tallest box) ───────────────────
+
+y_ceil <- max(df$Average.Diameter.mm) * 1.2
+y_label <- y_ceil * 0.85
+
+# ── Plot 1: Boxplot + jitter (mirrors your template exactly) ──
+p1 <- ggplot(df, aes(x = Genotype, y = Average.Diameter.mm, fill = Genotype)) +
+
+  geom_boxplot(
+    alpha         = 0.7,
+    outlier.shape = NA,
+    width         = 0.5,
+    colour        = "black",
+    linewidth     = 0.5
+  ) +
+
+  geom_jitter(
+    width  = 0.15,
+    size   = 1.8,
+    alpha  = 0.55,
+    colour = "black"
+  ) +
+
+  geom_text(
+    data        = cld_df,
+    aes(x = Genotype, label = .group),
+    y           = y_label,
+    inherit.aes = FALSE,
+    size        = 8,
+    fontface    = "bold",
+    colour      = "grey20"
+  ) +
+
+  geom_text(
+    data        = n_df,
+    aes(x = Genotype, label = label),
+    y           = -Inf,
+    vjust       = 4.2,
+    inherit.aes = FALSE,
+    size        = 6,
+    colour      = "grey40"
+  ) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x       = "Genotype",
+    y       = "Average root diameter (mm)",
+    caption = "Shared letters indicate no significant difference (sidak HSD, p > 0.05; glmmTMB, Gaussian)"
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    panel.grid      = element_blank(),
+    axis.line       = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks      = element_line(colour = "black", linewidth = 0.5),
+    axis.title      = element_text(size = 26, face = "bold"),
+    axis.title.x    = element_text(size = 26, face = "bold", margin = margin(t = 24)),
+    axis.text       = element_text(size = 22, colour = "black"),
+    axis.text.x     = element_text(face = "italic", margin = margin(t = 15)),
+    plot.caption    = element_text(size = 12, colour = "grey40", hjust = 0, margin = margin(t = 10)),
+    plot.margin     = margin(t = 25, r = 25, b = 25, l = 25)
+  )
+
+
+p1 + coord_cartesian(clip = "off")
+
+```
+
+### Convex Area
+
+```{r, fig.width=16, fig.height=12, dpi=300}
+
+# ── 1. Inspect the trait ──────────────────────────────────────
+summary(df$Convex.Area.mm2)
+hist(df$Convex.Area.mm2, breaks = 15, main = "Convex Area distribution")
+
+# ── 1. Fit full nested model ──────────────────────────────────
+convex_full <- glmmTMB(
+  (Convex.Area.mm2) ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, family = gaussian()
+)
+VarCorr(convex_full)
+check_singularity(convex_full) 
+
+# get error:   Model convergence problem; non-positive-definite Hessian matrix. See vignette('troubleshooting')
+# will simplify model as std. dev. of seed:plate:batch is incredibly small (1.2363e-95)
+
+# ── 3. Simplified model (only if full model fails) ────────────
+convex_tmb <- glmmTMB(
+  (Convex.Area.mm2) ~ Genotype + (1 | Batch/Plate),
+  data = df, family = gaussian()
+)
+
+VarCorr(convex_tmb)
+summary(convex_tmb)
+check_singularity(convex_tmb) 
+
+# plate:batch has very small effect and get NaNs inc conditional model so will drop plate effect
+
+# Plate interaction is incredibly small so will drop 
+# ── 3. Simplified model (only if simplified model fails) ────────────
+convex_tmb <- glmmTMB(
+  (Convex.Area.mm2) ~ Genotype + (1 | Batch),
+  data = df, family = gaussian()
+)
+
+VarCorr(convex_tmb)
+check_singularity(convex_tmb) 
+
+# ── 4. Assumption checks (on whichever model passed) ─────────
+sim_res <- simulateResiduals(convex_tmb, n = 1000)
+plot(sim_res)                               # QQ + residuals vs fitted
+testUniformity(sim_res)                     # p > 0.05 = distribution correct
+testDispersion(sim_res)                     # ratio ≈ 1.0
+plotResiduals(sim_res, form = df$Genotype)  # no patterns per genotype
+
+# residuals show that there is some snaking so will try log transforming to see if fit is better 
+
+convex_tmb <- glmmTMB( log(Convex.Area.mm2) ~ Genotype + (1 | Batch), data = df, family = gaussian() ) 
+sim_res <- simulateResiduals(convex_tmb, n = 1000)
+plot(sim_res)                               # QQ + residuals vs fitted
+testUniformity(sim_res)                     # p > 0.05 = distribution correct
+testDispersion(sim_res)                     # ratio ≈ 1.0
+plotResiduals(sim_res, form = df$Genotype)  # no patterns per genotype
+
+# imroved fit so will keep this log transformed model 
+
+# ── 5. Test overall Genotype effect ──────────────────────────
+car::Anova(convex_tmb, type = "III")
+
+
+# ── 6. Pairwise comparisons + CLD ────────────────────────────
+emm <- emmeans(convex_tmb, ~ Genotype, type = "response")
+pairs(emm, adjust = "sidak")
+
+cld_df <- as.data.frame(cld(emm, adjust = "sidak",
+                             Letters = letters, alpha = 0.05)) %>%
+  mutate(.group = trimws(.group))
+
+n_df <- df %>%
+  count(Genotype) %>%
+  mutate(label = paste0("n=", n))
+
+
+# ── 7. Plot 1 — Boxplot ───────────────────────────────────────
+
+y_ceil <- max(df$Convex.Area.mm2) * 1.2
+y_label <- y_ceil * 0.87
+
+p1 <- ggplot(df, aes(x = Genotype, y = Convex.Area.mm2, fill = Genotype)) +
+
+  geom_boxplot(
+    alpha = 0.7, outlier.shape = NA,
+    width = 0.5, colour = "black", linewidth = 0.5
+  ) +
+
+  geom_jitter(width = 0.15, size = 1.8, alpha = 0.55, colour = "black") +
+
+  geom_text(
+    data = cld_df, aes(x = Genotype, label = .group),
+    y = y_label, inherit.aes = FALSE,
+    size = 5, fontface = "bold", colour = "grey20"
+  ) +
+
+  geom_text(
+    data = n_df, aes(x = Genotype, label = label),
+    y = -Inf, vjust = 4.2, inherit.aes = FALSE,
+    size = 3.5, colour = "grey40"
+  ) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x       = "Genotype",
+    y       = expression(Convex~area~(mm^2)),
+    caption = "Shared letters indicate no significant difference (sidak HSD, p > 0.05; glmmTMB, Gaussian log)"
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.line       = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks      = element_line(colour = "black", linewidth = 0.5),
+    axis.title      = element_text(size = 14, face = "bold"),
+    axis.text       = element_text(size = 14, colour = "black"),
+    axis.text.x     = element_text(face = "italic", margin = margin(t = 3)),
+    plot.caption    = element_text(size = 9, colour = "grey40", hjust = 0),
+    plot.margin     = margin(t = 10, r = 15, b = 30, l = 10)
+  )
+
+p1 + coord_cartesian(clip = "off")
+```
+
+### Network Area
+
+```{r, fig.width=16, fig.height=12, dpi=300}
+# ============================================================
+#  Network Area Analysis
+# ============================================================
+
+# ── 1. Inspect the trait ──────────────────────────────────────
+summary(df$Network.Area.mm2)
+hist(df$Network.Area.mm2, breaks = 15, main = "Network Area distribution")
+
+
+# ── 2. Fit full nested model first ───────────────────────────
+network_full <- glmmTMB(
+  (Network.Area.mm2) ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, family = gaussian()
+)
+
+VarCorr(network_full)
+check_singularity(network_full)
+summary(network_full)
+
+# Standard deviation is incredibly small for plate:batch so getting the Hessian matrix error so will use a model which drops this interaction
+
+
+# ── 3. Simplified model (use if full model fails) ─────────────
+network_tmb <- glmmTMB(
+  Network.Area.mm2 ~ Genotype + (1 | Batch) + (1 | Seed:Plate:Batch),
+  data = df, family = gaussian()
+)
+
+VarCorr(network_tmb)
+check_singularity(network_tmb)
+summary(network_tmb)   # confirm real SEs and AIC
+
+
+# ── 4. Assumption checks ──────────────────────────────────────
+sim_res <- simulateResiduals(network_tmb, n = 1000)
+plot(sim_res)
+testUniformity(sim_res)
+testDispersion(sim_res)
+plotResiduals(sim_res, form = df$Genotype)
+
+# residuals show poor fit (significant deviation from outlier test) so will log transform the data
+
+# ── 3. Log transformed model (use if full model fails) ─────────────
+network_tmb <- glmmTMB(
+  log(Network.Area.mm2) ~ Genotype + (1 | Batch) + (1 | Seed:Plate:Batch),
+  data = df, family = gaussian()
+)
+
+VarCorr(network_tmb)
+check_singularity(network_tmb)
+summary(network_tmb)   # confirm real SEs and AIC
+
+
+# ── 4. Assumption checks ──────────────────────────────────────
+sim_res <- simulateResiduals(network_tmb, n = 1000)
+plot(sim_res)
+testUniformity(sim_res)
+testDispersion(sim_res)
+plotResiduals(sim_res, form = df$Genotype)
+
+
+# ── 5. Test overall Genotype effect ──────────────────────────
+car::Anova(network_tmb, type = "III")
+
+
+# ── 6. Pairwise comparisons + CLD ────────────────────────────
+emm <- emmeans(network_tmb, ~ Genotype, type = "response")
+pairs(emm, adjust = "sidak")
+
+cld_df <- as.data.frame(cld(emm, adjust = "sidak",
+                             Letters = letters, alpha = 0.05)) %>%
+  mutate(.group = trimws(.group))
+
+n_df <- df %>%
+  count(Genotype) %>%
+  mutate(label = paste0("n=", n))
+
+
+# ── 7. Plot 1 — Boxplot ───────────────────────────────────────
+
+y_ceil <- max(df$Network.Area.mm2) * 1.22
+y_label <- y_ceil * 0.8555
+
+p1 <- ggplot(df, aes(x = Genotype, y = Network.Area.mm2, fill = Genotype)) +
+
+  geom_boxplot(
+    alpha = 0.7, outlier.shape = NA,
+    width = 0.5, colour = "black", linewidth = 0.5
+  ) +
+
+  geom_jitter(width = 0.15, size = 1.8, alpha = 0.55, colour = "black") +
+
+  geom_text(
+    data = cld_df, aes(x = Genotype, label = .group),
+    y = y_label, inherit.aes = FALSE,
+    size = 5, fontface = "bold", colour = "grey20"
+  ) +
+
+  geom_text(
+    data = n_df, aes(x = Genotype, label = label),
+    y = -Inf, vjust = 4.2, inherit.aes = FALSE,
+    size = 3.5, colour = "grey40"
+  ) +
+
+  scale_fill_brewer(palette = "Set2") +
+ 
+  labs(
+    x       = "Genotype",
+    y       = expression(Network~area~(mm^2)),
+    caption = "Shared letters indicate no significant difference (sidak HSD, p > 0.05; glmmTMB, Gaussian log)"
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.line       = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks      = element_line(colour = "black", linewidth = 0.5),
+    axis.title      = element_text(size = 14, face = "bold"),
+    axis.text       = element_text(size = 14, colour = "black"),
+    axis.text.x     = element_text(face = "italic", margin = margin(t = 3)),
+    plot.caption    = element_text(size = 9, colour = "grey40", hjust = 0),
+    plot.margin     = margin(t = 10, r = 15, b = 30, l = 10)
+  )
+
+p1 + coord_cartesian(clip = "off")
+```
+
+### Solidity
+
+```{r, fig.width=16, fig.height=12, dpi=300}
+# ============================================================
+#  Solidity Analysis
+#  Solidity is a proportion (0–1) — Beta regression appropriate
+# ============================================================
+
+# ── 1. Inspect distribution ───────────────────────────────────
+summary(df$Solidity)
+hist(df$Solidity, breaks = 15, main = "Solidity distribution")
+# Solidity is bounded 0–1 so Gaussian is inappropriate by definition
+# Beta family is the correct choice for proportions
+
+
+# ── 2. Check for exact 0s or 1s (Beta cannot handle these) ───
+sum(df$Solidity == 0)
+sum(df$Solidity == 1)
+# If any exist, apply small correction:
+# df$Solidity <- (df$Solidity * (nrow(df) - 1) + 0.5) / nrow(df)
+
+
+# ── 3. Fit full nested model ──────────────────────────────────
+solidity_tmb <- glmmTMB(
+  Solidity ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, family = beta_family()
+)
+
+VarCorr(solidity_tmb)
+check_singularity(solidity_tmb)
+summary(solidity_tmb)
+
+# singularity is true so will reduce the model 
+
+# ── 3. Fit reduced model ──────────────────────────────────
+solidity_tmb <- glmmTMB(
+  Solidity ~ Genotype + (1 | Batch/Plate),
+  data = df, family = beta_family()
+)
+
+VarCorr(solidity_tmb)
+check_singularity(solidity_tmb)
+summary(solidity_tmb)
+
+# singularity is false so happy to continue on to assumption checks
+
+# ── 5. Assumption checks ──────────────────────────────────────
+sim_res <- simulateResiduals(solidity_tmb, n = 1000)
+plot(sim_res)                               # QQ + residuals vs fitted
+testUniformity(sim_res)                     # p > 0.05 = Beta appropriate
+testDispersion(sim_res)                     # ratio ≈ 1.0
+plotResiduals(sim_res, form = df$Genotype)  # no patterns per genotype
+
+# assumptions all look good so happy to continue 
+
+# ── 6. Test overall Genotype effect ──────────────────────────
+car::Anova(solidity_tmb, type = "III")
+
+
+# ── 7. Pairwise comparisons + CLD ────────────────────────────
+# type = "response" back-transforms from logit link to 0-1 scale
+emm <- emmeans(solidity_tmb, ~ Genotype, type = "response")
+pairs(emm, adjust = "sidak")
+
+cld_df <- as.data.frame(cld(emm, adjust = "sidak",
+                             Letters = letters, alpha = 0.05)) %>%
+  mutate(.group = trimws(.group))
+
+n_df <- df %>%
+  count(Genotype) %>%
+  mutate(label = paste0("n=", n))
+
+
+# ── 8. Plot 1 — Boxplot ───────────────────────────────────────
+
+# ── Solidity plot — y-axis zoomed to data range ───────────────
+
+y_ceil <- max(df$Solidity) * 1.22
+y_label <- y_ceil * 0.95
+
+p1 <- ggplot(df, aes(x = Genotype, y = Solidity, fill = Genotype)) +
+
+  geom_boxplot(
+    alpha         = 0.7,
+    outlier.shape = NA,
+    width         = 0.5,
+    colour        = "black",
+    linewidth     = 0.5
+  ) +
+
+  geom_jitter(
+    width  = 0.15,
+    size   = 1.8,
+    alpha  = 0.55,
+    colour = "black"
+  ) +
+
+  geom_text(
+    data        = cld_df,
+    aes(x = Genotype, label = .group),
+    y           = y_label,
+    inherit.aes = FALSE,
+    size        = 5,
+    fontface    = "bold",
+    colour      = "grey20"
+  ) +
+
+  geom_text(
+    data        = n_df,
+    aes(x = Genotype, label = label),
+    y           = -Inf,
+    vjust       = 4.2,
+    inherit.aes = FALSE,
+    size        = 3.5,
+    colour      = "grey40"
+  ) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x       = "Genotype",
+    y       = "Solidity (proportion)",
+    caption = "Shared letters indicate no significant difference (sidak HSD, p > 0.05; glmmTMB, Beta)"
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.line       = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks      = element_line(colour = "black", linewidth = 0.5),
+    axis.title      = element_text(size = 14, face = "bold"),
+    axis.text       = element_text(size = 14, colour = "black"),
+    axis.text.x     = element_text(face = "italic", margin = margin(t = 3)),
+    plot.caption    = element_text(size = 9, colour = "grey40", hjust = 0),
+    plot.margin     = margin(t = 10, r = 15, b = 30, l = 10)
+  )
+
+p1 + coord_cartesian(
+  ylim = c(0, max(df$Solidity) * 1.22),
+  clip = "off"
+)
+
+```
+
+### Width to Depth Ratio
+
+```{r, fig.width=16, fig.height=12, dpi=300}
+# ============================================================
+#  Width-to-Depth Ratio Analysis
+#  Ratio data — positive continuous, likely right-skewed
+#  Start raw, log-transform only if DHARMa flags poor fit
+# ============================================================
+
+# ── 1. Inspect distribution ───────────────────────────────────
+summary(df$`Width.to.Depth.Ratio`)
+class(df$`Width.to.Depth.Ratio`)
+hist(df$`Width.to.Depth.Ratio`, breaks = 15, main = "Width-to-Depth Ratio distribution")
+
+
+# ── 2. Fit full nested model on raw scale ────────────────────
+wdr_full <- glmmTMB(
+  `Width.to.Depth.Ratio` ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, family = gaussian()
+)
+
+VarCorr(wdr_full)
+check_singularity(wdr_full)
+summary(wdr_full)
+
+# check assumptions 
+sim_res <- simulateResiduals(wdr_full, n = 1000)
+plot(sim_res)                               # QQ + residuals vs fitted
+testUniformity(sim_res)                     # p > 0.05 = raw Gaussian fine
+testDispersion(sim_res)                     # ratio ≈ 1.0
+plotResiduals(sim_res, form = df$Genotype)  # no patterns per genotype
+
+# singularity = true and poor model fit so trying reduced model 
+
+# try fitting reduced model
+wdr_tmb <- glmmTMB(
+  `Width.to.Depth.Ratio` ~ Genotype + (1 | Batch/Plate),
+  data = df, family = gaussian()
+)
+
+VarCorr(wdr_tmb)
+check_singularity(wdr_tmb)
+summary(wdr_tmb)
+
+# this model has singularity = true as the random effects are  close to zero but model fit was good and improtant to include some random effects so will continue with this model.
+
+# ── 4. Assumption checks ─────
+sim_res <- simulateResiduals(wdr_tmb, n = 1000)
+plot(sim_res)                               # QQ + residuals vs fitted
+testUniformity(sim_res)                     # p > 0.05 = raw Gaussian fine
+testDispersion(sim_res)                     # ratio ≈ 1.0
+plotResiduals(sim_res, form = df$Genotype)  # no patterns per genotype
+
+
+
+# ── 5. Test overall Genotype effect ──────────────────────────
+car::Anova(wdr_tmb, type = "III")
+
+
+# ── Pairwise comparisons + CLD ────────────────────────────────
+emm <- emmeans(wdr_tmb, ~ Genotype, type = "response")
+pairs(emm, adjust = "sidak")
+
+cld_df <- as.data.frame(cld(emm, adjust = "sidak",
+                             Letters = letters, alpha = 0.05)) %>%
+  mutate(.group = trimws(.group))
+
+n_df <- df %>%
+  count(Genotype) %>%
+  mutate(label = paste0("n=", n))
+
+# ── Plot ──────────────────────────────────────────────────────
+
+y_ceil <- max(df$Width.to.Depth.Ratio) * 1.22
+y_label <- y_ceil * 0.95
+
+p1 <- ggplot(df, aes(x = Genotype, y = Width.to.Depth.Ratio, fill = Genotype)) +
+
+  geom_boxplot(
+    alpha         = 0.7,
+    outlier.shape = NA,
+    width         = 0.5,
+    colour        = "black",
+    linewidth     = 0.5
+  ) +
+
+  geom_jitter(
+    width  = 0.15,
+    size   = 1.8,
+    alpha  = 0.55,
+    colour = "black"
+  ) +
+
+  geom_text(
+    data        = cld_df,
+    aes(x = Genotype, label = .group),
+    y           = y_label,
+    inherit.aes = FALSE,
+    size        = 5,
+    fontface    = "bold",
+    colour      = "grey20"
+  ) +
+
+  geom_text(
+    data        = n_df,
+    aes(x = Genotype, label = label),
+    y           = -Inf,
+    vjust       = 4.2,
+    inherit.aes = FALSE,
+    size        = 3.5,
+    colour      = "grey40"
+  ) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x       = "Genotype",
+    y       = "Width-to-depth ratio",
+    caption = "Shared letters indicate no significant difference (sidak HSD, p > 0.05; glmmTMB, Gaussian)"
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.line       = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks      = element_line(colour = "black", linewidth = 0.5),
+    axis.title      = element_text(size = 14, face = "bold"),
+    axis.text       = element_text(size = 14, colour = "black"),
+    axis.text.x     = element_text(face = "italic", margin = margin(t = 3)),
+    plot.caption    = element_text(size = 9, colour = "grey40", hjust = 0),
+    plot.margin     = margin(t = 10, r = 15, b = 30, l = 10)
+  )
+
+p1 + coord_cartesian(
+  ylim = c(0, max(df$Width.to.Depth.Ratio) * 1.22),
+  clip = "off"
+)
+
+# this is the same result as the model with no random effects included so happy to continue with this result.
+```
+
+### Steep Angle Frequency
+
+```{r, fig.width=16, fig.height=12, dpi=300}
+# ============================================================
+#  Steep Angle Frequency Analysis
+#  Frequency/proportion bounded 0-1 — Beta regression
+#  Check for exact 0s or 1s before fitting
+# ============================================================
+
+# Per-genotype Var/Mean — Poisson assumes Var = Mean exactly.
+# Ratios >> 1 within genotypes suggest NB is needed.
+df %>%
+  group_by(Genotype) %>%
+  summarise(Mean     = round(mean(Steep.Angle.Frequency), 2),
+            Variance = round(var(Steep.Angle.Frequency),  2),
+            Var_Mean = round(var(Steep.Angle.Frequency) /
+                               mean(Steep.Angle.Frequency), 2))
+
+# ── 1. Inspect distribution ───────────────────────────────────
+summary(df$Steep.Angle.Frequency)
+hist(df$Steep.Angle.Frequency, breaks = 15, main = "Steep Angle Frequency distribution")
+
+# Check for exact 0s or 1s — Beta cannot handle boundary values
+sum(df$Steep.Angle.Frequency == 0)
+sum(df$Steep.Angle.Frequency == 1)
+
+# If any exist, apply small boundary correction:
+# df$Steep.Angle.Frequency <- (df$Steep.Angle.Frequency * (nrow(df) - 1) + 0.5) / nrow(df)
+
+
+# ── 2. Fit full nested model ──────────────────────────────────
+steep_full <- glmmTMB(
+  Steep.Angle.Frequency ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, family = beta_family()
+)
+
+VarCorr(steep_full)
+check_singularity(steep_full)
+summary(steep_full)
+
+# assumptions
+
+sim_res <- simulateResiduals(steep_full, n = 1000)
+plot(sim_res)
+testUniformity(sim_res)                     # p > 0.05 = Beta appropriate
+testDispersion(sim_res)                     # ratio ≈ 1.0
+plotResiduals(sim_res, form = df$Genotype)  # no patterns per genotype
+
+
+# try reducing the model
+steep_tmb <- glmmTMB(
+  Steep.Angle.Frequency ~ Genotype + (1 | Batch/Plate),
+  data = df, family = beta_family()
+)
+
+VarCorr(steep_tmb)
+check_singularity(steep_tmb)
+summary(steep_tmb)
+
+steep_tmb <- glmmTMB(
+  Steep.Angle.Frequency ~ Genotype + (1 | Batch),
+  data = df, family = beta_family()
+)
+
+VarCorr(steep_tmb)
+check_singularity(steep_tmb)
+summary(steep_tmb)
+
+steep_tmb <- glmmTMB(
+  Steep.Angle.Frequency ~ Genotype,
+  data = df, family = beta_family()
+)
+
+summary(steep_tmb)
+
+# reduced model does not have homogeneity of variance so full model is probably better. I will try both reduced and full model to see if same result is drawn.
+
+
+# Assumption checks
+
+sim_res <- simulateResiduals(steep_tmb, n = 1000)
+plot(sim_res)
+testUniformity(sim_res)                     # p > 0.05 = Beta appropriate
+testDispersion(sim_res)                     # ratio ≈ 1.0
+plotResiduals(sim_res, form = df$Genotype)  # no patterns per genotype
+
+
+# ── 5. Test overall Genotype effect ──────────────────────────
+car::Anova(steep_tmb, type = "III")
+
+
+# ── 6. Pairwise comparisons + CLD ────────────────────────────
+emm <- emmeans(steep_tmb, ~ Genotype, type = "response")
+pairs(emm, adjust = "sidak")
+
+cld_df <- as.data.frame(cld(emm, adjust = "sidak",
+                             Letters = letters, alpha = 0.05)) %>%
+  mutate(.group = trimws(.group))
+
+class(df$Genotype)   # should return "factor"
+length(df$Genotype)  # should return 71
+
+
+# Effect size
+
+# Cohen's d = difference in means / pooled SD
+# Interpretation: 0.2 = small, 0.5 = medium, 0.8 = large
+
+emm_steep <- emmeans(steep_tmb, ~ Genotype)
+
+eff_steep <- eff_size(
+  emm_steep,
+  sigma = sigma(steep_tmb),   # residual SD from model
+  edf   = df.residual(steep_tmb)
+)
+print(eff_steep)
+
+# ── 7. Plot 1 — Boxplot ───────────────────────────────────────
+
+y_ceil <- max(df$Steep.Angle.Frequency) * 1.22
+y_label <- y_ceil * 0.95
+
+p1 <- ggplot(df, aes(x = Genotype, y = Steep.Angle.Frequency, fill = Genotype)) +
+
+  geom_boxplot(
+    alpha         = 0.7,
+    outlier.shape = NA,
+    width         = 0.5,
+    colour        = "black",
+    linewidth     = 0.5
+  ) +
+
+  geom_jitter(
+    width  = 0.15,
+    size   = 1.8,
+    alpha  = 0.55,
+    colour = "black"
+  ) +
+
+  geom_text(
+    data        = cld_df,
+    aes(x = Genotype, label = .group),
+    y           = y_label,
+    inherit.aes = FALSE,
+    size        = 5,
+    fontface    = "bold",
+    colour      = "grey20"
+  ) +
+
+  geom_text(
+    data        = n_df,
+    aes(x = Genotype, label = label),
+    y           = -Inf,
+    vjust       = 4.2,
+    inherit.aes = FALSE,
+    size        = 3.5,
+    colour      = "grey40"
+  ) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x       = "Genotype",
+    y       = "Steep angle frequency",
+    caption = "Shared letters indicate no significant difference (sidak HSD, p > 0.05; glmmTMB, Beta)"
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.line       = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks      = element_line(colour = "black", linewidth = 0.5),
+    axis.title      = element_text(size = 14, face = "bold"),
+    axis.text       = element_text(size = 14, colour = "black"),
+    axis.text.x     = element_text(face = "italic", margin = margin(t = 3)),
+    plot.caption    = element_text(size = 9, colour = "grey40", hjust = 0),
+    plot.margin     = margin(t = 10, r = 15, b = 30, l = 10)
+  )
+
+p1 + coord_cartesian(
+  ylim = c(0, max(df$Steep.Angle.Frequency) * 1.22),
+  clip = "off"
+)
+
+# full model
+
+# ── 6. Pairwise comparisons + CLD ────────────────────────────
+emm <- emmeans(steep_full, ~ Genotype, type = "response")
+pairs(emm, adjust = "sidak")
+
+cld_df <- as.data.frame(cld(emm, adjust = "sidak",
+                             Letters = letters, alpha = 0.05)) %>%
+  mutate(.group = trimws(.group))
+
+# Effect size
+
+# Cohen's d = difference in means / pooled SD
+# Interpretation: 0.2 = small, 0.5 = medium, 0.8 = large
+
+emm_steep <- emmeans(steep_full, ~ Genotype)
+
+eff_steep <- eff_size(
+  emm_steep,
+  sigma = sigma(steep_full),   # residual SD from model
+  edf   = df.residual(steep_full)
+) 
+print(eff_steep)
+
+# ── 7. Plot 1 — Boxplot ───────────────────────────────────────
+
+y_ceil <- max(df$Steep.Angle.Frequency) * 1.22
+y_label <- y_ceil * 0.95
+
+p1 <- ggplot(df, aes(x = Genotype, y = Steep.Angle.Frequency, fill = Genotype)) +
+
+  geom_boxplot(
+    alpha         = 0.7,
+    outlier.shape = NA,
+    width         = 0.5,
+    colour        = "black",
+    linewidth     = 0.5
+  ) +
+
+  geom_jitter(
+    width  = 0.15,
+    size   = 1.8,
+    alpha  = 0.55,
+    colour = "black"
+  ) +
+
+  geom_text(
+    data        = cld_df,
+    aes(x = Genotype, label = .group),
+    y           = y_label,
+    inherit.aes = FALSE,
+    size        = 8,
+    fontface    = "bold",
+    colour      = "grey20"
+  ) +
+
+  geom_text(
+    data        = n_df,
+    aes(x = Genotype, label = label),
+    y           = -Inf,
+    vjust       = 4.2,
+    inherit.aes = FALSE,
+    size        = 6,
+    colour      = "grey40"
+  ) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x       = "Genotype",
+    y       = "Steep angle frequency",
+    caption = "Shared letters indicate no significant difference (sidak HSD, p > 0.05; glmmTMB, Beta)"
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    panel.grid      = element_blank(),
+    axis.line       = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks      = element_line(colour = "black", linewidth = 0.5),
+    axis.title      = element_text(size = 26, face = "bold"),
+    axis.title.x    = element_text(size = 26, face = "bold", margin = margin(t = 24)),
+    axis.text       = element_text(size = 22, colour = "black"),
+    axis.text.x     = element_text(face = "italic", margin = margin(t = 15)),
+    plot.caption    = element_text(size = 12, colour = "grey40", hjust = 0, margin = margin(t = 10)),
+    plot.margin     = margin(t = 25, r = 25, b = 25, l = 25)
+  )
+
+
+p1 + coord_cartesian(
+  ylim = c(0, max(df$Steep.Angle.Frequency) * 1.22),
+  clip = "off"
+)
+
+# difference here is where Dabbi groups - will go with full model for the figure as the model fit was better but good to see largely the same significant differences. 
+```
+
+### Depth
+
+```{r, fig.width=16, fig.height=12, dpi=300}
+# ============================================================
+#  Depth Analysis
+#  Positive continuous — start raw Gaussian, log if needed
+# ============================================================
+
+# ── 1. Inspect distribution ───────────────────────────────────
+summary(df$Depth.mm)
+hist(df$Depth.mm, breaks = 15, main = "Depth distribution")
+
+
+# ── 2. Fit full nested model ──────────────────────────────────
+depth_full <- glmmTMB(
+  Depth.mm ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, family = gaussian()
+)
+
+VarCorr(depth_full)
+check_singularity(depth_full)
+summary(depth_full)
+
+# fit looks good so happy to continue with this but will do some assumption checks 
+
+# ── 4. Assumption checks ─────
+sim_res <- simulateResiduals(depth_full, n = 1000)
+plot(sim_res)
+testUniformity(sim_res)                     # p > 0.05 = raw Gaussian fine
+testDispersion(sim_res)                     # ratio ≈ 1.0
+plotResiduals(sim_res, form = df$Genotype)
+
+
+# ── 5. Test overall Genotype effect ──────────────────────────
+car::Anova(depth_full, type = "III")
+
+
+# ── 6. Pairwise comparisons + CLD ────────────────────────────
+emm <- emmeans(depth_full, ~ Genotype)
+pairs(emm, adjust = "sidak")
+
+cld_df <- as.data.frame(cld(emm, adjust = "sidak",
+                             Letters = letters, alpha = 0.05)) %>%
+  mutate(.group = trimws(.group))
+
+n_df <- df %>%
+  count(Genotype) %>%
+  mutate(label = paste0("n=", n))
+
+
+# ── 7. Plot 1 — Boxplot ───────────────────────────────────────
+
+y_ceil <- max(df$Depth.mm) * 1.22
+y_label <- y_ceil * 0.95
+
+p1 <- ggplot(df, aes(x = Genotype, y = Depth.mm, fill = Genotype)) +
+
+  geom_boxplot(
+    alpha         = 0.7,
+    outlier.shape = NA,
+    width         = 0.5,
+    colour        = "black",
+    linewidth     = 0.5
+  ) +
+
+  geom_jitter(
+    width  = 0.15,
+    size   = 1.8,
+    alpha  = 0.55,
+    colour = "black"
+  ) +
+
+  geom_text(
+    data        = cld_df,
+    aes(x = Genotype, label = .group),
+    y           = y_label,
+    inherit.aes = FALSE,
+    size        = 5,
+    fontface    = "bold",
+    colour      = "grey20"
+  ) +
+
+  geom_text(
+    data        = n_df,
+    aes(x = Genotype, label = label),
+    y           = -Inf,
+    vjust       = 4.2,
+    inherit.aes = FALSE,
+    size        = 3.5,
+    colour      = "grey40"
+  ) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x       = "Genotype",
+    y       = "Depth (mm)",
+    caption = "Shared letters indicate no significant difference (sidak HSD, p > 0.05; glmmTMB, Gaussian)"
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.line       = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks      = element_line(colour = "black", linewidth = 0.5),
+    axis.title      = element_text(size = 14, face = "bold"),
+    axis.text       = element_text(size = 14, colour = "black"),
+    axis.text.x     = element_text(face = "italic", margin = margin(t = 3)),
+    plot.caption    = element_text(size = 9, colour = "grey40", hjust = 0),
+    plot.margin     = margin(t = 10, r = 15, b = 30, l = 10)
+  )
+
+p1 + coord_cartesian(
+  ylim = c(0, max(df$Depth.mm) * 1.22),
+  clip = "off"
+)
+
+```
+
+### Surface area
+
+```{r, fig.width=16, fig.height=12, dpi=300}
+# ============================================================
+#  Depth Analysis
+#  Positive continuous — start raw Gaussian, log if needed
+# ============================================================
+
+# ── 1. Inspect distribution ───────────────────────────────────
+summary(df$Surface.Area.mm2)
+hist(df$Surface.Area.mm2, breaks = 15, main = "Surface Area")
+
+
+# ── 2. Fit full nested model ──────────────────────────────────
+SA_full <- glmmTMB(
+  Surface.Area.mm2 ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, family = gaussian()
+)
+
+VarCorr(SA_full)
+check_singularity(SA_full)
+summary(SA_full)
+
+# Get Hessian matrix error because plate:batch interaction is very small so will drop this interaction
+SA_tmb <- glmmTMB(
+  Surface.Area.mm2 ~ Genotype + (1 | Batch) + (1 | Batch:Plate:Seed),
+  data = df, family = gaussian()
+)
+
+VarCorr(SA_tmb)
+check_singularity(SA_tmb)
+summary(SA_tmb)
+
+# Still getting error so dropping the batch:plate:seed interaction
+SA_tmb <- glmmTMB(
+  Surface.Area.mm2 ~ Genotype + (1 | Batch),
+  data = df, family = gaussian()
+)
+
+VarCorr(SA_tmb)
+check_singularity(SA_tmb)
+summary(SA_tmb)
+
+
+sim_res <- simulateResiduals(SA_tmb, n = 1000)
+plot(sim_res)
+testUniformity(sim_res)                     # p > 0.05 = raw Gaussian fine
+testDispersion(sim_res)                     # ratio ≈ 1.0
+plotResiduals(sim_res, form = df$Genotype)
+
+# fit is pretty good so happy to continue 
+
+# ── 5. Test overall Genotype effect ──────────────────────────
+car::Anova(SA_tmb, type = "III")
+
+# ── 6. Pairwise comparisons + CLD ────────────────────────────
+emm <- emmeans(SA_tmb, ~ Genotype)
+pairs(emm, adjust = "sidak")
+
+cld_df <- as.data.frame(cld(emm, adjust = "sidak",
+                             Letters = letters, alpha = 0.05)) %>%
+  mutate(.group = trimws(.group))
+
+n_df <- df %>%
+  count(Genotype) %>%
+  mutate(label = paste0("n=", n))
+
+
+# ── 7. Plot 1 — Boxplot ───────────────────────────────────────
+
+y_ceil <- max(df$Surface.Area.mm2) * 1.22
+y_label <- y_ceil * 0.95
+
+p1 <- ggplot(df, aes(x = Genotype, y = Surface.Area.mm2, fill = Genotype)) +
+
+  geom_boxplot(
+    alpha         = 0.7,
+    outlier.shape = NA,
+    width         = 0.5,
+    colour        = "black",
+    linewidth     = 0.5
+  ) +
+
+  geom_jitter(
+    width  = 0.15,
+    size   = 1.8,
+    alpha  = 0.55,
+    colour = "black"
+  ) +
+
+  geom_text(
+    data        = cld_df,
+    aes(x = Genotype, label = .group),
+    y           = y_label,
+    inherit.aes = FALSE,
+    size        = 5,
+    fontface    = "bold",
+    colour      = "grey20"
+  ) +
+
+  geom_text(
+    data        = n_df,
+    aes(x = Genotype, label = label),
+    y           = -Inf,
+    vjust       = 4.2,
+    inherit.aes = FALSE,
+    size        = 3.5,
+    colour      = "grey40"
+  ) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x       = "Genotype",
+    y       = "Surface Area (mm)",
+    caption = "Shared letters indicate no significant difference (sidak HSD, p > 0.05; glmmTMB, Gaussian)"
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.line       = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks      = element_line(colour = "black", linewidth = 0.5),
+    axis.title      = element_text(size = 14, face = "bold"),
+    axis.text       = element_text(size = 14, colour = "black"),
+    axis.text.x     = element_text(face = "italic", margin = margin(t = 3)),
+    plot.caption    = element_text(size = 9, colour = "grey40", hjust = 0),
+    plot.margin     = margin(t = 10, r = 15, b = 30, l = 10)
+  )
+
+p1 + coord_cartesian(
+  ylim = c(0, max(df$Surface.Area.mm2) * 1.22),
+  clip = "off"
+)
+
+```
+
+### Volume
+
+```{r, fig.width=16, fig.height=12, dpi=300}
+# ============================================================
+# Volume Analysis  
+# Positive continuous — start raw Gaussian, log if needed
+# ============================================================
+
+# Per-genotype Var/Mean — Poisson assumes Var = Mean exactly.
+# Ratios >> 1 within genotypes suggest NB is needed.
+df %>%
+  group_by(Genotype) %>%
+  summarise(Mean     = round(mean(Volume.mm3), 2),
+            Variance = round(var(Volume.mm3),  2),
+            Var_Mean = round(var(Volume.mm3) /
+                               mean(Volume.mm3), 2))
+
+# ── 1. Inspect distribution ───────────────────────────────────
+summary(df$Volume.mm3)
+hist(df$Volume.mm3, breaks = 15, main = "Volume (mm³)")
+
+# ── 2. Fit models ────────────────────────────────────────
+Vol_raw <- glmmTMB(
+  Volume.mm3 ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, 
+  family = gaussian()
+)
+
+VarCorr(Vol_raw)
+check_singularity(Vol_raw)
+summary(Vol_raw)
+
+# ── 4. Diagnostics: raw model ────────────────────────────────
+sim_res_raw <- simulateResiduals(Vol_raw, n = 1000)
+plot(sim_res_raw)
+testUniformity(sim_res_raw)    # p > 0.05 = good
+testDispersion(sim_res_raw)    # ratio ≈ 1.0
+plotResiduals(sim_res_raw, form = df$Genotype)
+
+# some snaking so will try log transforming to see if there is an improved fit
+Vol_raw <- glmmTMB(
+  log(Volume.mm3) ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, 
+  family = gaussian()
+)
+
+VarCorr(Vol_raw)
+summary(Vol_raw)
+check_singularity(Vol_raw)
+
+sim_res_raw <- simulateResiduals(Vol_raw, n = 1000)
+plot(sim_res_raw)
+testUniformity(sim_res_raw)    # p > 0.05 = good
+testDispersion(sim_res_raw)    # ratio ≈ 1.0
+plotResiduals(sim_res_raw, form = df$Genotype)
+
+# overall fit with log transformation ooks better but there is within-group deviations from uniformity and non singular so will keep the non-log transformed model 
+
+Vol_tmb <- glmmTMB(
+  Volume.mm3 ~ Genotype + (1 | Batch/Plate/Seed),
+  data = df, 
+  family = gaussian()
+)
+
+# ── 5. Diagnostics: log model ────────────────────────────────
+sim_res_vol <- simulateResiduals(Vol_tmb, n = 1000)
+plot(sim_res_vol)
+testUniformity(sim_res_vol)    # p > 0.05 = good
+testDispersion(sim_res_vol)    # ratio ≈ 1.0
+plotResiduals(sim_res_vol, form = df$Genotype)
+
+
+car::Anova(Vol_tmb, type = "III")
+
+# Pairwise (type = "response" ONLY if using log model)
+emm <- emmeans(Vol_tmb, ~ Genotype, 
+               type = "response")
+pairs(emm, adjust = "sidak")
+
+# Cohen's d = difference in means / pooled SD
+# Interpretation: 0.2 = small, 0.5 = medium, 0.8 = large
+
+eff_vol <- eff_size(
+  emm,
+  sigma = sigma(Vol_tmb),   # residual SD from model
+  edf   = df.residual(Vol_tmb)
+)
+print(eff_vol)
+
+# ── 8. CLD and sample sizes ──────────────────────────────────
+cld_df <- as.data.frame(cld(emm, adjust = "sidak",
+                             Letters = letters, alpha = 0.05)) %>%
+  mutate(.group = trimws(.group))
+
+n_df <- df %>%
+  count(Genotype) %>%
+  mutate(label = paste0("n=", n))
+
+# ── 9. Plot — Boxplot ────────────────────────────────────────
+
+y_ceil <- max(df$Volume.mm3) * 1.22
+y_label <- y_ceil * 0.95
+
+p1 <- ggplot(df, aes(x = Genotype, y = Volume.mm3, fill = Genotype)) +
+  
+  geom_boxplot(
+    alpha         = 0.7,
+    outlier.shape = NA,
+    width         = 0.5,
+    colour        = "black",
+    linewidth     = 0.5
+  ) +
+  
+  geom_jitter(
+    width  = 0.15,
+    size   = 1.8,
+    alpha  = 0.55,
+    colour = "black"
+  ) +
+  
+  geom_text(
+    data        = cld_df,
+    aes(x = Genotype, label = .group),
+    y           = y_label,
+    inherit.aes = FALSE,
+    size        = 8,
+    fontface    = "bold",
+    colour      = "grey20"
+  ) +
+  
+  geom_text(
+    data        = n_df,
+    aes(x = Genotype, label = label),
+    y           = -Inf,
+    vjust       = 4.2,
+    inherit.aes = FALSE,
+    size        = 6,
+    colour      = "grey40"
+  ) +
+  
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x       = "Genotype",
+    y       = "Volume (mm³)",
+    caption = "Shared letters indicate no significant difference (sidak HSD, p > 0.05; glmmTMB, Gaussian)"
+  ) +
+  
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    panel.grid      = element_blank(),
+    axis.line       = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks      = element_line(colour = "black", linewidth = 0.5),
+    axis.title      = element_text(size = 26, face = "bold"),
+    axis.title.x    = element_text(size = 26, face = "bold", margin = margin(t = 24)),
+    axis.text       = element_text(size = 22, colour = "black"),
+    axis.text.x     = element_text(face = "italic", margin = margin(t = 15)),
+    plot.caption    = element_text(size = 12, colour = "grey40", hjust = 0, margin = margin(t = 10)),
+    plot.margin     = margin(t = 25, r = 25, b = 25, l = 25)
+  )
+
+p1 + coord_cartesian(
+  ylim = c(0, max(df$Volume.mm3) * 1.22),
+  clip = "off"
+)
+
+```
