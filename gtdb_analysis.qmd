@@ -3,6 +3,7 @@ title: "teff_gtdb_analysis"
 format:
   html:
     toc: true
+        toc-depth: 3
     theme: cosmo
     code-fold: true
     fig-align: center
